@@ -1,0 +1,408 @@
+"""
+Machine Learning Models for Handwritten Number Recognition System (HNRS)
+Implements CNN, SVM, and Random Forest models for digit classification
+"""
+
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import pickle
+import os
+from typing import Tuple, Dict, Any
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+class CNNModel:
+    """Convolutional Neural Network for digit recognition"""
+    
+    def __init__(self, input_shape=(28, 28, 1), num_classes=10):
+        self.input_shape = input_shape
+        self.num_classes = num_classes
+        self.model = None
+        self.history = None
+        
+    def build_model(self):
+        """Build CNN architecture optimized for MNIST digit recognition"""
+        self.model = keras.Sequential([
+            # First Convolutional Block
+            layers.Conv2D(32, (3, 3), activation='relu', input_shape=self.input_shape),
+            layers.BatchNormalization(),
+            layers.Conv2D(32, (3, 3), activation='relu'),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.25),
+            
+            # Second Convolutional Block
+            layers.Conv2D(64, (3, 3), activation='relu'),
+            layers.BatchNormalization(),
+            layers.Conv2D(64, (3, 3), activation='relu'),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.25),
+            
+            # Third Convolutional Block
+            layers.Conv2D(128, (3, 3), activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.25),
+            
+            # Dense Layers
+            layers.Flatten(),
+            layers.Dense(512, activation='relu'),
+            layers.BatchNormalization(),
+            layers.Dropout(0.5),
+            layers.Dense(256, activation='relu'),
+            layers.Dropout(0.5),
+            layers.Dense(self.num_classes, activation='softmax')
+        ])
+        
+        # Compile model
+        self.model.compile(
+            optimizer='adam',
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return self.model
+    
+    def train(self, X_train, y_train, X_val=None, y_val=None, epochs=20, batch_size=128):
+        """Train the CNN model"""
+        if self.model is None:
+            self.build_model()
+        
+        # Callbacks for better training
+        callbacks = [
+            keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+            keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=3)
+        ]
+        
+        # Train model
+        validation_data = (X_val, y_val) if X_val is not None else None
+        
+        self.history = self.model.fit(
+            X_train, y_train,
+            batch_size=batch_size,
+            epochs=epochs,
+            validation_data=validation_data,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        return self.history
+    
+    def evaluate(self, X_test, y_test):
+        """Evaluate model performance"""
+        if self.model is None:
+            raise ValueError("Model not trained yet!")
+        
+        # Get predictions
+        y_pred_proba = self.model.predict(X_test)
+        y_pred = np.argmax(y_pred_proba, axis=1)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        report = classification_report(y_test, y_pred)
+        cm = confusion_matrix(y_test, y_pred)
+        
+        return {
+            'accuracy': accuracy,
+            'predictions': y_pred,
+            'probabilities': y_pred_proba,
+            'classification_report': report,
+            'confusion_matrix': cm
+        }
+    
+    def save_model(self, filepath):
+        """Save trained model"""
+        if self.model is None:
+            raise ValueError("No model to save!")
+        self.model.save(filepath)
+    
+    def load_model(self, filepath):
+        """Load trained model"""
+        self.model = keras.models.load_model(filepath)
+    
+    def predict(self, X):
+        """Make predictions on input data"""
+        if self.model is None:
+            raise ValueError("Model not trained or loaded yet!")
+        
+        # Ensure input has correct shape
+        if len(X.shape) == 3:
+            X = X.reshape(X.shape[0], X.shape[1], X.shape[2], 1)
+        elif len(X.shape) == 2:
+            X = X.reshape(1, X.shape[0], X.shape[1], 1)
+        
+        predictions = self.model.predict(X)
+        return np.argmax(predictions, axis=1), predictions
+    
+    def plot_training_history(self):
+        """Plot training history"""
+        if self.history is None:
+            print("No training history available!")
+            return
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        
+        # Plot accuracy
+        ax1.plot(self.history.history['accuracy'], label='Training Accuracy')
+        if 'val_accuracy' in self.history.history:
+            ax1.plot(self.history.history['val_accuracy'], label='Validation Accuracy')
+        ax1.set_title('Model Accuracy')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Accuracy')
+        ax1.legend()
+        
+        # Plot loss
+        ax2.plot(self.history.history['loss'], label='Training Loss')
+        if 'val_loss' in self.history.history:
+            ax2.plot(self.history.history['val_loss'], label='Validation Loss')
+        ax2.set_title('Model Loss')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Loss')
+        ax2.legend()
+        
+        plt.tight_layout()
+        plt.show()
+
+class SVMModel:
+    """Support Vector Machine for digit recognition"""
+    
+    def __init__(self, kernel='rbf', C=1.0, gamma='scale'):
+        self.kernel = kernel
+        self.C = C
+        self.gamma = gamma
+        self.model = None
+        
+    def train(self, X_train, y_train):
+        """Train SVM model"""
+        # Flatten images for SVM
+        X_train_flat = X_train.reshape(X_train.shape[0], -1)
+        
+        # Initialize and train SVM
+        self.model = SVC(
+            kernel=self.kernel,
+            C=self.C,
+            gamma=self.gamma,
+            probability=True,  # Enable probability estimates
+            random_state=42
+        )
+        
+        print(f"Training SVM with {X_train_flat.shape[0]} samples...")
+        self.model.fit(X_train_flat, y_train)
+        print("SVM training completed!")
+        
+        return self.model
+    
+    def evaluate(self, X_test, y_test):
+        """Evaluate SVM performance"""
+        if self.model is None:
+            raise ValueError("Model not trained yet!")
+        
+        # Flatten test images
+        X_test_flat = X_test.reshape(X_test.shape[0], -1)
+        
+        # Get predictions
+        y_pred = self.model.predict(X_test_flat)
+        y_pred_proba = self.model.predict_proba(X_test_flat)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        report = classification_report(y_test, y_pred)
+        cm = confusion_matrix(y_test, y_pred)
+        
+        return {
+            'accuracy': accuracy,
+            'predictions': y_pred,
+            'probabilities': y_pred_proba,
+            'classification_report': report,
+            'confusion_matrix': cm
+        }
+    
+    def save_model(self, filepath):
+        """Save trained SVM model"""
+        if self.model is None:
+            raise ValueError("No model to save!")
+        with open(filepath, 'wb') as f:
+            pickle.dump(self.model, f)
+    
+    def load_model(self, filepath):
+        """Load trained SVM model"""
+        with open(filepath, 'rb') as f:
+            self.model = pickle.load(f)
+    
+    def predict(self, X):
+        """Make predictions on input data"""
+        if self.model is None:
+            raise ValueError("Model not trained or loaded yet!")
+        
+        # Flatten images for SVM
+        if len(X.shape) > 2:
+            X_flat = X.reshape(X.shape[0], -1)
+        else:
+            X_flat = X.reshape(1, -1)
+        
+        predictions = self.model.predict(X_flat)
+        probabilities = self.model.predict_proba(X_flat)
+        return predictions, probabilities
+
+class RandomForestModel:
+    """Random Forest for digit recognition"""
+    
+    def __init__(self, n_estimators=100, max_depth=None, random_state=42):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.random_state = random_state
+        self.model = None
+        
+    def train(self, X_train, y_train):
+        """Train Random Forest model"""
+        # Flatten images for Random Forest
+        X_train_flat = X_train.reshape(X_train.shape[0], -1)
+        
+        # Initialize and train Random Forest
+        self.model = RandomForestClassifier(
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            random_state=self.random_state,
+            n_jobs=-1  # Use all available cores
+        )
+        
+        print(f"Training Random Forest with {X_train_flat.shape[0]} samples...")
+        self.model.fit(X_train_flat, y_train)
+        print("Random Forest training completed!")
+        
+        return self.model
+    
+    def evaluate(self, X_test, y_test):
+        """Evaluate Random Forest performance"""
+        if self.model is None:
+            raise ValueError("Model not trained yet!")
+        
+        # Flatten test images
+        X_test_flat = X_test.reshape(X_test.shape[0], -1)
+        
+        # Get predictions
+        y_pred = self.model.predict(X_test_flat)
+        y_pred_proba = self.model.predict_proba(X_test_flat)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        report = classification_report(y_test, y_pred)
+        cm = confusion_matrix(y_test, y_pred)
+        
+        return {
+            'accuracy': accuracy,
+            'predictions': y_pred,
+            'probabilities': y_pred_proba,
+            'classification_report': report,
+            'confusion_matrix': cm
+        }
+    
+    def save_model(self, filepath):
+        """Save trained Random Forest model"""
+        if self.model is None:
+            raise ValueError("No model to save!")
+        with open(filepath, 'wb') as f:
+            pickle.dump(self.model, f)
+    
+    def load_model(self, filepath):
+        """Load trained Random Forest model"""
+        with open(filepath, 'rb') as f:
+            self.model = pickle.load(f)
+    
+    def predict(self, X):
+        """Make predictions on input data"""
+        if self.model is None:
+            raise ValueError("Model not trained or loaded yet!")
+        
+        # Flatten images for Random Forest
+        if len(X.shape) > 2:
+            X_flat = X.reshape(X.shape[0], -1)
+        else:
+            X_flat = X.reshape(1, -1)
+        
+        predictions = self.model.predict(X_flat)
+        probabilities = self.model.predict_proba(X_flat)
+        return predictions, probabilities
+
+class ModelComparison:
+    """Compare performance of different models"""
+    
+    def __init__(self):
+        self.results = {}
+    
+    def add_result(self, model_name, evaluation_result):
+        """Add evaluation result for a model"""
+        self.results[model_name] = evaluation_result
+    
+    def compare_accuracies(self):
+        """Compare accuracies of all models"""
+        if not self.results:
+            print("No results to compare!")
+            return
+        
+        print("\n" + "="*50)
+        print("MODEL ACCURACY COMPARISON")
+        print("="*50)
+        
+        for model_name, result in self.results.items():
+            print(f"{model_name:15}: {result['accuracy']:.4f}")
+        
+        # Find best model
+        best_model = max(self.results.items(), key=lambda x: x[1]['accuracy'])
+        print(f"\nBest Model: {best_model[0]} ({best_model[1]['accuracy']:.4f})")
+    
+    def plot_confusion_matrices(self):
+        """Plot confusion matrices for all models"""
+        if not self.results:
+            print("No results to plot!")
+            return
+        
+        n_models = len(self.results)
+        fig, axes = plt.subplots(1, n_models, figsize=(5*n_models, 4))
+        
+        if n_models == 1:
+            axes = [axes]
+        
+        for idx, (model_name, result) in enumerate(self.results.items()):
+            sns.heatmap(
+                result['confusion_matrix'], 
+                annot=True, 
+                fmt='d', 
+                ax=axes[idx],
+                cmap='Blues'
+            )
+            axes[idx].set_title(f'{model_name}\nAccuracy: {result["accuracy"]:.4f}')
+            axes[idx].set_xlabel('Predicted')
+            axes[idx].set_ylabel('Actual')
+        
+        plt.tight_layout()
+        plt.show()
+
+# Test function
+if __name__ == "__main__":
+    print("Testing model implementations...")
+    
+    # Create dummy data for testing
+    X_dummy = np.random.random((100, 28, 28, 1))
+    y_dummy = np.random.randint(0, 10, 100)
+    
+    # Test CNN
+    print("\nTesting CNN...")
+    cnn = CNNModel()
+    cnn.build_model()
+    print("CNN model built successfully!")
+    
+    # Test SVM
+    print("\nTesting SVM...")
+    svm = SVMModel()
+    print("SVM model initialized successfully!")
+    
+    # Test Random Forest
+    print("\nTesting Random Forest...")
+    rf = RandomForestModel()
+    print("Random Forest model initialized successfully!")
+    
+    print("\nAll model classes implemented successfully!")

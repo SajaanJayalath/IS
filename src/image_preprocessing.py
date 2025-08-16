@@ -1,0 +1,277 @@
+"""
+Image Preprocessing Module for Handwritten Number Recognition System
+Implements advanced preprocessing techniques for real-world handwritten images
+"""
+
+import cv2
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+from typing import Tuple, Optional, List
+
+class ImagePreprocessor:
+    """
+    Advanced image preprocessing for handwritten number recognition
+    """
+    
+    def __init__(self):
+        self.preprocessing_steps = []
+        
+    def load_image(self, image_path: str) -> np.ndarray:
+        """Load image from file path"""
+        try:
+            image = cv2.imread(image_path)
+            if image is None:
+                raise ValueError(f"Could not load image from {image_path}")
+            return image
+        except Exception as e:
+            print(f"Error loading image: {e}")
+            return None
+    
+    def convert_to_grayscale(self, image: np.ndarray) -> np.ndarray:
+        """Convert image to grayscale"""
+        if len(image.shape) == 3:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return image
+    
+    def histogram_equalization(self, image: np.ndarray) -> np.ndarray:
+        """Apply histogram equalization to improve contrast"""
+        return cv2.equalizeHist(image)
+    
+    def adaptive_histogram_equalization(self, image: np.ndarray, clip_limit: float = 2.0) -> np.ndarray:
+        """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)"""
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+        return clahe.apply(image)
+    
+    def gaussian_blur(self, image: np.ndarray, kernel_size: int = 5, sigma: float = 1.0) -> np.ndarray:
+        """Apply Gaussian blur for noise reduction"""
+        return cv2.GaussianBlur(image, (kernel_size, kernel_size), sigma)
+    
+    def median_filter(self, image: np.ndarray, kernel_size: int = 5) -> np.ndarray:
+        """Apply median filter for noise reduction"""
+        return cv2.medianBlur(image, kernel_size)
+    
+    def adaptive_threshold(self, image: np.ndarray, max_value: int = 255, 
+                          adaptive_method: int = cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                          threshold_type: int = cv2.THRESH_BINARY,
+                          block_size: int = 11, C: int = 2) -> np.ndarray:
+        """Apply adaptive thresholding for binarization"""
+        return cv2.adaptiveThreshold(image, max_value, adaptive_method, 
+                                   threshold_type, block_size, C)
+    
+    def morphological_operations(self, image: np.ndarray, operation: str = 'opening', 
+                                kernel_size: int = 3, iterations: int = 1) -> np.ndarray:
+        """Apply morphological operations"""
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        
+        if operation == 'opening':
+            return cv2.morphologyEx(image, cv2.MORPH_OPEN, kernel, iterations=iterations)
+        elif operation == 'closing':
+            return cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+        elif operation == 'erosion':
+            return cv2.erode(image, kernel, iterations=iterations)
+        elif operation == 'dilation':
+            return cv2.dilate(image, kernel, iterations=iterations)
+        else:
+            return image
+    
+    def edge_detection(self, image: np.ndarray, low_threshold: int = 50, 
+                      high_threshold: int = 150) -> np.ndarray:
+        """Apply Canny edge detection"""
+        return cv2.Canny(image, low_threshold, high_threshold)
+    
+    def deskew_image(self, image: np.ndarray) -> np.ndarray:
+        """Correct image rotation/skew"""
+        # Find contours to determine skew angle
+        contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return image
+            
+        # Find the largest contour (assuming it's the main content)
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Get minimum area rectangle
+        rect = cv2.minAreaRect(largest_contour)
+        angle = rect[2]
+        
+        # Correct angle
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+            
+        # Rotate image
+        if abs(angle) > 0.5:  # Only rotate if angle is significant
+            (h, w) = image.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+            rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, 
+                                   borderMode=cv2.BORDER_REPLICATE)
+            return rotated
+        
+        return image
+    
+    def resize_image(self, image: np.ndarray, target_size: Tuple[int, int] = (28, 28)) -> np.ndarray:
+        """Resize image to target size while maintaining aspect ratio"""
+        h, w = image.shape[:2]
+        target_w, target_h = target_size
+        
+        # Calculate scaling factor to maintain aspect ratio
+        scale = min(target_w / w, target_h / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Resize image
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Create target size image with padding
+        result = np.zeros((target_h, target_w), dtype=np.uint8)
+        
+        # Center the resized image
+        y_offset = (target_h - new_h) // 2
+        x_offset = (target_w - new_w) // 2
+        result[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+        
+        return result
+    
+    def normalize_image(self, image: np.ndarray) -> np.ndarray:
+        """Normalize image pixel values to 0-1 range"""
+        return image.astype(np.float32) / 255.0
+    
+    def invert_if_needed(self, image: np.ndarray) -> np.ndarray:
+        """Invert image if background is darker than foreground"""
+        # Calculate mean of border pixels to determine background
+        border_pixels = np.concatenate([
+            image[0, :],  # top row
+            image[-1, :],  # bottom row
+            image[:, 0],  # left column
+            image[:, -1]  # right column
+        ])
+        
+        border_mean = np.mean(border_pixels)
+        center_mean = np.mean(image[image.shape[0]//4:3*image.shape[0]//4, 
+                                   image.shape[1]//4:3*image.shape[1]//4])
+        
+        # If border is darker than center, invert
+        if border_mean < center_mean:
+            return 255 - image
+        return image
+    
+    def preprocess_pipeline(self, image: np.ndarray, steps: List[str] = None) -> np.ndarray:
+        """
+        Apply complete preprocessing pipeline
+        
+        Args:
+            image: Input image
+            steps: List of preprocessing steps to apply
+                  Options: ['grayscale', 'hist_eq', 'clahe', 'blur', 'median', 
+                           'threshold', 'morphology', 'deskew', 'invert', 'resize', 'normalize']
+        """
+        if steps is None:
+            steps = ['grayscale', 'clahe', 'median', 'threshold', 'morphology', 
+                    'deskew', 'invert', 'resize', 'normalize']
+        
+        processed = image.copy()
+        
+        for step in steps:
+            if step == 'grayscale':
+                processed = self.convert_to_grayscale(processed)
+            elif step == 'hist_eq':
+                processed = self.histogram_equalization(processed)
+            elif step == 'clahe':
+                processed = self.adaptive_histogram_equalization(processed)
+            elif step == 'blur':
+                processed = self.gaussian_blur(processed)
+            elif step == 'median':
+                processed = self.median_filter(processed)
+            elif step == 'threshold':
+                processed = self.adaptive_threshold(processed)
+            elif step == 'morphology':
+                processed = self.morphological_operations(processed, 'opening')
+            elif step == 'deskew':
+                processed = self.deskew_image(processed)
+            elif step == 'invert':
+                processed = self.invert_if_needed(processed)
+            elif step == 'resize':
+                processed = self.resize_image(processed)
+            elif step == 'normalize':
+                processed = self.normalize_image(processed)
+        
+        return processed
+    
+    def visualize_preprocessing_steps(self, image: np.ndarray, steps: List[str] = None) -> None:
+        """Visualize the effect of each preprocessing step"""
+        if steps is None:
+            steps = ['grayscale', 'clahe', 'threshold', 'morphology', 'deskew']
+        
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axes = axes.ravel()
+        
+        # Original image
+        axes[0].imshow(image, cmap='gray')
+        axes[0].set_title('Original')
+        axes[0].axis('off')
+        
+        processed = image.copy()
+        
+        for i, step in enumerate(steps[:5], 1):
+            if step == 'grayscale':
+                processed = self.convert_to_grayscale(processed)
+            elif step == 'clahe':
+                processed = self.adaptive_histogram_equalization(processed)
+            elif step == 'threshold':
+                processed = self.adaptive_threshold(processed)
+            elif step == 'morphology':
+                processed = self.morphological_operations(processed, 'opening')
+            elif step == 'deskew':
+                processed = self.deskew_image(processed)
+            
+            axes[i].imshow(processed, cmap='gray')
+            axes[i].set_title(f'After {step}')
+            axes[i].axis('off')
+        
+        plt.tight_layout()
+        plt.show()
+
+def preprocess_for_mnist_model(image: np.ndarray) -> np.ndarray:
+    """
+    Preprocess image to match MNIST format for model prediction
+    
+    Args:
+        image: Input image (can be any size, grayscale or color)
+    
+    Returns:
+        Preprocessed image ready for MNIST model (28x28, normalized)
+    """
+    preprocessor = ImagePreprocessor()
+    
+    # Standard preprocessing pipeline for MNIST compatibility
+    steps = ['grayscale', 'clahe', 'median', 'threshold', 'morphology', 
+             'deskew', 'invert', 'resize', 'normalize']
+    
+    processed = preprocessor.preprocess_pipeline(image, steps)
+    
+    # Ensure correct shape for CNN model (28, 28, 1)
+    if len(processed.shape) == 2:
+        processed = processed.reshape(28, 28, 1)
+    
+    return processed
+
+if __name__ == "__main__":
+    # Test preprocessing with sample image
+    preprocessor = ImagePreprocessor()
+    
+    # Create a test image (simulated handwritten digit)
+    test_image = np.zeros((100, 100), dtype=np.uint8)
+    cv2.circle(test_image, (50, 50), 30, 255, -1)  # White circle
+    cv2.circle(test_image, (50, 50), 15, 0, -1)    # Black hole (making it look like 0)
+    
+    print("Testing image preprocessing pipeline...")
+    processed = preprocessor.preprocess_pipeline(test_image)
+    print(f"Original shape: {test_image.shape}")
+    print(f"Processed shape: {processed.shape}")
+    print(f"Processed range: {processed.min():.3f} - {processed.max():.3f}")
+    
+    # Visualize results
+    preprocessor.visualize_preprocessing_steps(test_image)
