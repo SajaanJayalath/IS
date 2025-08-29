@@ -316,3 +316,28 @@ sample_images/
 - Canvas drawing preprocessing may need optimization
 - Error handling could be more robust in GUI
 - Performance optimization for real-time processing
+
+## Application Execution Analysis (29/08/2025)
+
+### **Main Entry Points Identified**:
+1. **GUI Application**: `src/main.py --gui` or `src/gui.py` directly
+2. **Backend/CLI**: `src/main.py` with various command line options
+3. **Combined System**: Both can run simultaneously or separately
+
+### **Execution Methods**:
+- **GUI Only**: `python src/main.py --gui` or `python src/gui.py`
+- **CLI Testing**: `python src/main.py --test-models` or `python src/main.py --test-image <path>`
+- **Dependency Check**: `python src/main.py --check-deps`
+
+### **BAT File Requirements**:
+- Must handle Windows environment (PowerShell/CMD)
+- Should provide options for GUI, backend testing, or both
+- Include dependency checking
+- Handle error cases gracefully
+- Provide user-friendly interface
+
+### **System Architecture**:
+- **Frontend**: tkinter GUI (`src/gui.py`) - Standalone application
+- **Backend**: Command-line interface (`src/main.py`) - Multiple functions
+- **Models**: Pre-trained ML models (CNN, SVM, Random Forest)
+- **Processing**: Image preprocessing and segmentation pipelines
