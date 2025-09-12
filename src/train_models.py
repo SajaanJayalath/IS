@@ -7,27 +7,53 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time
 import os
-from data_loader import MNISTDataLoader
+import argparse
+import json
+from datetime import datetime
+from data_loader import MNISTDataLoader, get_data_loader
 from models import CNNModel, SVMModel, RandomForestModel, ModelComparison
 
-def create_models_directory():
+def _project_paths():
+    """Compute project-rooted paths independent of the current working dir."""
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(src_dir)
+    models_dir = os.path.join(project_root, 'models')
+    data_dir = os.path.join(project_root, 'MNIST_CSV')
+    return project_root, models_dir, data_dir
+
+def create_models_directory(models_dir: str):
     """Create directory to save trained models"""
-    if not os.path.exists('models'):
-        os.makedirs('models')
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
         print("Created 'models' directory for saving trained models")
 
-def train_all_models():
-    """Train and evaluate all models"""
+def train_all_models(dataset: str = 'mnist_csv', data_dir: str | None = None, epochs: int = 10, subset_size: int = 10000):
+    """Train and evaluate all models
+
+    Args:
+        dataset: 'mnist_csv' or 'image_folder'
+        data_dir: path to dataset root (required for image_folder)
+        epochs: CNN training epochs
+        subset_size: number of samples for SVM/RF speed-up
+    """
     print("="*60)
     print("HANDWRITTEN NUMBER RECOGNITION SYSTEM - MODEL TRAINING")
     print("="*60)
     
-    # Create models directory
-    create_models_directory()
+    # Resolve paths and create models directory
+    project_root, models_dir, data_dir = _project_paths()
+    create_models_directory(models_dir)
     
     # Load data
-    print("\n1. Loading MNIST data...")
-    data_loader = MNISTDataLoader(data_dir='../MNIST_CSV')
+    print("\n1. Loading data...")
+    if dataset == 'mnist_csv':
+        # project-rooted MNIST_CSV directory by default
+        _project_root, _models_dir, default_data_dir = _project_paths()
+        use_dir = data_dir or default_data_dir
+    else:
+        use_dir = data_dir  # image_folder requires explicit path
+
+    data_loader = get_data_loader(dataset, use_dir)
     
     # Load training and test data
     X_train, y_train, X_test, y_test = data_loader.load_data()
@@ -65,11 +91,11 @@ def train_all_models():
     start_time = time.time()
     cnn_model = CNNModel()
     
-    # Train CNN with reduced epochs for faster training
+    # Train CNN
     cnn_history = cnn_model.train(
         X_train_cnn, y_train_cnn, 
         X_val_cnn, y_val_cnn, 
-        epochs=10,  # Reduced for faster training
+        epochs=epochs,
         batch_size=128
     )
     
@@ -81,9 +107,16 @@ def train_all_models():
     cnn_results = cnn_model.evaluate(X_test_processed, y_test)
     comparison.add_result("CNN", cnn_results)
     
-    # Save CNN model
-    cnn_model.save_model('models/cnn_model.h5')
-    print("CNN model saved to 'models/cnn_model.h5'")
+    # Save CNN model (generic + dataset-specific filenames)
+    cnn_generic_path = os.path.join(models_dir, 'cnn_model.h5')
+    cnn_dataset_path = os.path.join(models_dir, f"cnn_model_{dataset}.h5")
+    cnn_model.save_model(cnn_generic_path)
+    try:
+        cnn_model.save_model(cnn_dataset_path)
+    except Exception:
+        pass
+    print(f"CNN model saved to '{cnn_generic_path}'")
+    print(f"CNN model (dataset) saved to '{cnn_dataset_path}'")
     
     # Train SVM Model
     print("\n" + "="*50)
@@ -94,7 +127,7 @@ def train_all_models():
     svm_model = SVMModel(kernel='rbf', C=1.0, gamma='scale')
     
     # Use subset of data for SVM to speed up training
-    subset_size = 10000  # Use 10k samples for faster training
+    subset_size = min(subset_size, len(X_train_flat))
     indices = np.random.choice(len(X_train_flat), subset_size, replace=False)
     X_train_svm = X_train_flat[indices]
     y_train_svm = y_train[indices]
@@ -110,9 +143,16 @@ def train_all_models():
     svm_results = svm_model.evaluate(X_test_processed, y_test)
     comparison.add_result("SVM", svm_results)
     
-    # Save SVM model
-    svm_model.save_model('models/svm_model.pkl')
-    print("SVM model saved to 'models/svm_model.pkl'")
+    # Save SVM model (generic + dataset-specific filenames)
+    svm_generic_path = os.path.join(models_dir, 'svm_model.pkl')
+    svm_dataset_path = os.path.join(models_dir, f"svm_model_{dataset}.pkl")
+    svm_model.save_model(svm_generic_path)
+    try:
+        svm_model.save_model(svm_dataset_path)
+    except Exception:
+        pass
+    print(f"SVM model saved to '{svm_generic_path}'")
+    print(f"SVM model (dataset) saved to '{svm_dataset_path}'")
     
     # Train Random Forest Model
     print("\n" + "="*50)
@@ -137,9 +177,16 @@ def train_all_models():
     rf_results = rf_model.evaluate(X_test_processed, y_test)
     comparison.add_result("Random Forest", rf_results)
     
-    # Save Random Forest model
-    rf_model.save_model('models/rf_model.pkl')
-    print("Random Forest model saved to 'models/rf_model.pkl'")
+    # Save Random Forest model (generic + dataset-specific filenames)
+    rf_generic_path = os.path.join(models_dir, 'rf_model.pkl')
+    rf_dataset_path = os.path.join(models_dir, f"rf_model_{dataset}.pkl")
+    rf_model.save_model(rf_generic_path)
+    try:
+        rf_model.save_model(rf_dataset_path)
+    except Exception:
+        pass
+    print(f"Random Forest model saved to '{rf_generic_path}'")
+    print(f"Random Forest model (dataset) saved to '{rf_dataset_path}'")
     
     # Compare all models
     print("\n" + "="*60)
@@ -173,15 +220,62 @@ def train_all_models():
     if hasattr(cnn_model, 'history') and cnn_model.history is not None:
         print("\nGenerating CNN training history plot...")
         cnn_model.plot_training_history()
-    
+
     print("\n" + "="*60)
     print("MODEL TRAINING COMPLETED SUCCESSFULLY!")
     print("="*60)
-    print("\nTrained models saved in 'models/' directory:")
+    print("\nTrained models saved in directory:")
+    print(models_dir)
     print("- cnn_model.h5 (CNN)")
     print("- svm_model.pkl (SVM)")
     print("- rf_model.pkl (Random Forest)")
     
+    # Save training metadata for traceability
+    try:
+        def _to_serializable(x):
+            if isinstance(x, np.ndarray):
+                return x.tolist()
+            return x
+
+        metadata = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "dataset": dataset,
+            "data_dir": os.path.abspath(use_dir) if use_dir else None,
+            "epochs": int(epochs),
+            "subset_size": int(subset_size),
+            "train_shapes": {
+                "X_train": list(X_train.shape),
+                "X_test": list(X_test.shape),
+            },
+            "times_seconds": {
+                "cnn_train": float(cnn_train_time),
+                "svm_train": float(svm_train_time),
+                "rf_train": float(rf_train_time),
+            },
+            "metrics": {
+                name: {
+                    "accuracy": float(res.get("accuracy", 0.0)),
+                    "classification_report": res.get("classification_report", ""),
+                    "confusion_matrix": _to_serializable(res.get("confusion_matrix")),
+                }
+                for name, res in comparison.results.items()
+            }
+        }
+        # Write generic metadata and dataset-specific metadata files
+        meta = os.path.join(models_dir, "metadata.json")
+        meta_ds = os.path.join(models_dir, f"metadata_{dataset}.json")
+        with open(meta, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        try:
+            with open(meta_ds, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        print(f"\nSaved training metadata to: {meta}")
+        print(f"Saved dataset-specific metadata to: {meta_ds}")
+    except Exception as e:
+        print(f"\nWarning: failed to write training metadata: {e}")
+
     return comparison
 
 def quick_test():
@@ -218,16 +312,33 @@ def quick_test():
     print("\nQuick test completed successfully!")
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "--quick-test":
+    parser = argparse.ArgumentParser(description="Train HNRS models")
+    parser.add_argument("--quick-test", action="store_true", help="Run a quick dummy-data test")
+    parser.add_argument("--dataset", choices=["mnist_csv", "image_folder", "emnist_digits", "svhn", "combined"], default="mnist_csv",
+                        help="Dataset source")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Data directory (required for image_folder)")
+    parser.add_argument("--epochs", type=int, default=10, help="CNN training epochs")
+    parser.add_argument("--subset-size", type=int, default=10000,
+                        help="Samples for SVM/RF speed-up")
+
+    args = parser.parse_args()
+
+    if args.quick_test:
         quick_test()
     else:
         try:
-            comparison = train_all_models()
+            comparison = train_all_models(dataset=args.dataset,
+                                          data_dir=args.data_dir,
+                                          epochs=args.epochs,
+                                          subset_size=args.subset_size)
         except FileNotFoundError as e:
+            _, _, default_csv_dir = _project_paths()
             print(f"\nError: {e}")
-            print("Make sure MNIST CSV files are in the 'MNIST_CSV' directory")
+            if args.dataset == 'mnist_csv':
+                print(f"Expected MNIST CSV files in: {default_csv_dir}")
+            else:
+                print("For image_folder, ensure structure: <root>/train/0..9[/images], optional <root>/test/0..9")
             print("Run with '--quick-test' flag to test with dummy data")
         except Exception as e:
             print(f"\nUnexpected error: {e}")

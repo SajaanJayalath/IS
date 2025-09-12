@@ -74,6 +74,49 @@ class ImagePreprocessor:
             return cv2.dilate(image, kernel, iterations=iterations)
         else:
             return image
+
+    def mnist_center_of_mass(self, image: np.ndarray) -> np.ndarray:
+        """
+        Center a 28x28 digit image by shifting its center of mass to the center.
+
+        Expects a single-channel image of shape (28, 28) with the digit as
+        bright foreground on dark background (MNIST style). Returns a 28x28 image
+        of the same dtype.
+        """
+        if image is None or image.size == 0:
+            return image
+
+        # Ensure 28x28 single-channel
+        if image.ndim == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if image.shape != (28, 28):
+            image = self.resize_image(image, (28, 28))
+
+        # Work in uint8 for cv2 moments; foreground should be white
+        img = image.copy()
+        if img.dtype != np.uint8:
+            # If it's normalized float, scale up
+            img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+
+        # Threshold to binary (white digit on black)
+        _, bw = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        # If background appears white (drawn case), invert to match MNIST
+        if bw.mean() > 127:
+            bw = 255 - bw
+
+        M = cv2.moments(bw)
+        if abs(M["m00"]) < 1e-3:
+            return image  # empty; nothing to center
+
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        shift_x = int(round(14 - cx))
+        shift_y = int(round(14 - cy))
+
+        M_shift = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
+        shifted = cv2.warpAffine(img, M_shift, (28, 28), flags=cv2.INTER_NEAREST, borderValue=0)
+        return shifted
     
     def edge_detection(self, image: np.ndarray, low_threshold: int = 50, 
                       high_threshold: int = 150) -> np.ndarray:
@@ -188,7 +231,13 @@ class ImagePreprocessor:
             elif step == 'threshold':
                 processed = self.adaptive_threshold(processed)
             elif step == 'morphology':
+                # Default remains opening for noise removal
                 processed = self.morphological_operations(processed, 'opening')
+            elif step == 'morphology_close':
+                # Alternative that preserves loops (useful for 6/9)
+                processed = self.morphological_operations(processed, 'closing')
+            elif step == 'center_mass':
+                processed = self.mnist_center_of_mass(processed)
             elif step == 'deskew':
                 processed = self.deskew_image(processed)
             elif step == 'invert':
@@ -247,8 +296,8 @@ def preprocess_for_mnist_model(image: np.ndarray) -> np.ndarray:
     preprocessor = ImagePreprocessor()
     
     # Standard preprocessing pipeline for MNIST compatibility
-    steps = ['grayscale', 'clahe', 'median', 'threshold', 'morphology', 
-             'deskew', 'invert', 'resize', 'normalize']
+    steps = ['grayscale', 'clahe', 'median', 'threshold', 'morphology_close',
+             'deskew', 'invert', 'resize', 'center_mass', 'normalize']
     
     processed = preprocessor.preprocess_pipeline(image, steps)
     

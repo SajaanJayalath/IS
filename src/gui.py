@@ -94,6 +94,7 @@ class HNRSApplication:
         self.segmenter = ImageSegmenter()
         self.multi_digit_processor = MultiDigitProcessor()
         self.models = {}
+        self.last_auto_seg_method: str | None = None
         
         # Current image
         self.current_image = None
@@ -108,34 +109,67 @@ class HNRSApplication:
     def load_models(self):
         """Load all trained models"""
         try:
+            # Determine possible model directories
+            src_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(src_dir)
+            primary_models_dir = os.path.join(project_root, 'models')
+            fallback_models_dir = os.path.join(src_dir, 'models')
+
+            def find_model_path(filename):
+                primary_path = os.path.join(primary_models_dir, filename)
+                fallback_path = os.path.join(fallback_models_dir, filename)
+                if os.path.exists(primary_path):
+                    return primary_path
+                if os.path.exists(fallback_path):
+                    return fallback_path
+                return None
+
+            # Prefer models trained on the combined dataset if present
+            def find_prefer_combined(basename: str) -> str | None:
+                pref = [
+                    basename.replace('.', '_combined.'),  # e.g., cnn_model_combined.h5
+                    basename,                              # generic fallback
+                ]
+                for name in pref:
+                    p = find_model_path(name)
+                    if p:
+                        return p
+                return None
+
             # Load CNN model
             cnn_model = CNNModel()
-            if os.path.exists('src/models/cnn_model.h5'):
-                cnn_model.load_model('src/models/cnn_model.h5')
+            cnn_path = find_prefer_combined('cnn_model.h5')
+            if cnn_path:
+                cnn_model.load_model(cnn_path)
                 self.models['CNN'] = cnn_model
                 print("CNN model loaded successfully")
             
             # Load SVM model
             svm_model = SVMModel()
-            if os.path.exists('src/models/svm_model.pkl'):
-                svm_model.load_model('src/models/svm_model.pkl')
+            svm_path = find_prefer_combined('svm_model.pkl')
+            if svm_path:
+                svm_model.load_model(svm_path)
                 self.models['SVM'] = svm_model
                 print("SVM model loaded successfully")
             
             # Load Random Forest model
             rf_model = RandomForestModel()
-            if os.path.exists('src/models/rf_model.pkl'):
-                rf_model.load_model('src/models/rf_model.pkl')
+            rf_path = find_prefer_combined('rf_model.pkl')
+            if rf_path:
+                rf_model.load_model(rf_path)
                 self.models['Random Forest'] = rf_model
                 print("Random Forest model loaded successfully")
                 
             # Set up multi-digit processor
-            self.multi_digit_processor.models = {
+            # Only include models that actually loaded (non-None)
+            available_models = {
                 'cnn': self.models.get('CNN'),
                 'svm': self.models.get('SVM'),
                 'rf': self.models.get('Random Forest')
             }
-            
+            # Filter out None entries to prevent NoneType.predict errors
+            self.multi_digit_processor.models = {k: v for k, v in available_models.items() if v is not None}
+
         except Exception as e:
             messagebox.showerror("Model Loading Error", f"Error loading models: {e}")
             print(f"Error loading models: {e}")
@@ -193,9 +227,13 @@ class HNRSApplication:
         model_label = ttk.Label(control_frame, text="Select Model:")
         model_label.pack(pady=(0, 5))
         
-        self.model_var = tk.StringVar(value="CNN")
-        model_combo = ttk.Combobox(control_frame, textvariable=self.model_var, 
-                                  values=list(self.models.keys()), state="readonly")
+        # Populate model dropdown with actually loaded models
+        loaded_model_names = list(self.models.keys())
+        # Default to first loaded model if available; otherwise keep placeholder
+        default_model = loaded_model_names[0] if loaded_model_names else "CNN"
+        self.model_var = tk.StringVar(value=default_model)
+        model_combo = ttk.Combobox(control_frame, textvariable=self.model_var,
+                                  values=loaded_model_names, state="readonly")
         model_combo.pack(pady=(0, 10))
         
         # Segmentation method
@@ -204,7 +242,7 @@ class HNRSApplication:
         
         self.segmentation_var = tk.StringVar(value="contours")
         seg_combo = ttk.Combobox(control_frame, textvariable=self.segmentation_var,
-                                values=["contours", "connected_components"], state="readonly")
+                                values=["Auto selection", "contours", "connected_components", "projection"], state="readonly")
         seg_combo.pack(pady=(0, 10))
         
         # Processing options
@@ -226,9 +264,12 @@ class HNRSApplication:
         
         ttk.Button(control_frame, text="Compare All Models", 
                   command=self.compare_all_models).pack(pady=5, fill=tk.X)
-        
+
         ttk.Button(control_frame, text="Show Model Performance", 
                   command=self.show_model_performance).pack(pady=5, fill=tk.X)
+
+        ttk.Button(control_frame, text="Compare Segmentation Methods",
+                  command=self.compare_segmentation_methods).pack(pady=5, fill=tk.X)
         
         # Right panel - Results
         results_frame = ttk.LabelFrame(main_frame, text="Recognition Results", padding="10")
@@ -313,16 +354,37 @@ class HNRSApplication:
             model_name = self.model_var.get().lower().replace(' ', '_')
             if model_name == 'random_forest':
                 model_name = 'rf'
-            
-            segmentation_method = self.segmentation_var.get()
-            
-            # Process multi-digit number
-            number_string, predictions, digit_images = self.multi_digit_processor.process_multi_digit_number(
-                self.current_image, model_name, segmentation_method
-            )
+
+            # Ensure the selected model is actually loaded
+            if model_name not in self.multi_digit_processor.models or \
+               self.multi_digit_processor.models.get(model_name) is None:
+                messagebox.showerror(
+                    "Model Not Loaded",
+                    "The selected model is not loaded. Please train or load models first."
+                )
+                self.update_status("Model not loaded")
+                return
+
+            selection_raw = self.segmentation_var.get()
+            segmentation_method = selection_raw.lower().replace(' ', '_')
+
+            # Process multi-digit number (with optional auto selection)
+            used_method_display = selection_raw
+            if segmentation_method == 'auto_selection':
+                number_string, predictions, digit_images, used_method, _ = self.multi_digit_processor.auto_select_segmentation(
+                    self.current_image, model_name
+                )
+                used_method_display = f"Auto -> {used_method}" if used_method else "Auto -> none"
+                self.last_auto_seg_method = used_method
+            else:
+                number_string, predictions, digit_images = self.multi_digit_processor.process_multi_digit_number(
+                    self.current_image, model_name, segmentation_method
+                )
+                used_method = segmentation_method
+                self.last_auto_seg_method = segmentation_method
             
             # Display results
-            self.display_results(number_string, predictions, digit_images)
+            self.display_results(number_string, predictions, digit_images, used_method_display)
             
             # Show visualizations if requested
             if self.show_preprocessing.get():
@@ -337,7 +399,7 @@ class HNRSApplication:
             messagebox.showerror("Error", f"Error processing image: {e}")
             self.update_status("Error during processing")
             
-    def display_results(self, number_string, predictions, digit_images):
+    def display_results(self, number_string, predictions, digit_images, segmentation_used: str | None = None):
         """Display recognition results in the text widget"""
         self.results_text.delete(1.0, tk.END)
         
@@ -357,7 +419,8 @@ class HNRSApplication:
         # Model information
         model_name = self.model_var.get()
         self.results_text.insert(tk.END, f"Model Used: {model_name}\n")
-        self.results_text.insert(tk.END, f"Segmentation: {self.segmentation_var.get()}\n")
+        seg_disp = segmentation_used if segmentation_used else self.segmentation_var.get()
+        self.results_text.insert(tk.END, f"Segmentation: {seg_disp}\n")
         self.results_text.insert(tk.END, f"Number of Digits: {len(predictions)}\n")
         
         # Average confidence
@@ -378,21 +441,30 @@ class HNRSApplication:
             self.results_text.insert(tk.END, "MODEL COMPARISON RESULTS\n")
             self.results_text.insert(tk.END, "="*50 + "\n\n")
             
-            segmentation_method = self.segmentation_var.get()
+            selection_raw = self.segmentation_var.get()
+            segmentation_method = selection_raw.lower().replace(' ', '_')
             
             # Test each model
             for model_display_name, model_key in [('CNN', 'cnn'), ('SVM', 'svm'), ('Random Forest', 'rf')]:
                 if model_key in self.multi_digit_processor.models and self.multi_digit_processor.models[model_key]:
                     try:
-                        number_string, predictions, _ = self.multi_digit_processor.process_multi_digit_number(
-                            self.current_image, model_key, segmentation_method
-                        )
+                        if segmentation_method == 'auto_selection':
+                            number_string, predictions, _, used_method, avg = self.multi_digit_processor.auto_select_segmentation(
+                                self.current_image, model_key
+                            )
+                            seg_used = f"Auto -> {used_method} ({avg:.3f})"
+                        else:
+                            number_string, predictions, _ = self.multi_digit_processor.process_multi_digit_number(
+                                self.current_image, model_key, segmentation_method
+                            )
+                            seg_used = selection_raw
                         
                         avg_confidence = np.mean([conf for _, conf in predictions]) if predictions else 0
                         
                         self.results_text.insert(tk.END, f"{model_display_name} Model:\n")
                         self.results_text.insert(tk.END, f"  Result: {number_string}\n")
                         self.results_text.insert(tk.END, f"  Avg Confidence: {avg_confidence:.3f}\n")
+                        self.results_text.insert(tk.END, f"  Segmentation: {seg_used}\n")
                         self.results_text.insert(tk.END, f"  Individual: {[pred[0] for pred in predictions]}\n\n")
                         
                     except Exception as e:
@@ -404,6 +476,42 @@ class HNRSApplication:
             
         except Exception as e:
             messagebox.showerror("Error", f"Error comparing models: {e}")
+
+    def compare_segmentation_methods(self):
+        """Run recognition using all segmentation methods and report outputs."""
+        if self.current_image is None:
+            messagebox.showwarning("Warning", "No image to process")
+            return
+
+        try:
+            # Determine selected model key
+            model_name = self.model_var.get().lower().replace(' ', '_')
+            if model_name == 'random_forest':
+                model_name = 'rf'
+
+            if model_name not in self.multi_digit_processor.models or \
+               self.multi_digit_processor.models.get(model_name) is None:
+                messagebox.showerror("Model Not Loaded", "The selected model is not loaded.")
+                return
+
+            methods = ["contours", "connected_components", "projection"]
+            self.results_text.delete(1.0, tk.END)
+            self.results_text.insert(tk.END, "SEGMENTATION METHOD COMPARISON\n")
+            self.results_text.insert(tk.END, "="*50 + "\n\n")
+
+            for m in methods:
+                try:
+                    number_string, predictions, _ = self.multi_digit_processor.process_multi_digit_number(
+                        self.current_image, model_name, m
+                    )
+                    avg_conf = np.mean([c for _, c in predictions]) if predictions else 0
+                    self.results_text.insert(tk.END, f"{m}: {number_string}  | digits: {[p[0] for p in predictions]}  | avg: {avg_conf:.3f}\n")
+                except Exception as e:
+                    self.results_text.insert(tk.END, f"{m}: Error - {e}\n")
+
+            self.update_status("Segmentation methods compared")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error comparing segmentation methods: {e}")
             
     def show_model_performance(self):
         """Show model performance metrics"""
@@ -508,8 +616,21 @@ class HNRSApplication:
             seg_window.title("Segmentation Visualization")
             seg_window.geometry("1000x600")
             
-            # Use segmenter visualization
-            self.segmenter.visualize_segmentation(self.current_image, self.segmentation_var.get())
+            # Get a Matplotlib figure and embed it in the Tk window
+            sel = self.segmentation_var.get()
+            method = sel.lower().replace(' ', '_')
+            if method == 'auto_selection':
+                method = self.last_auto_seg_method or 'contours'
+            fig = self.segmenter.visualize_segmentation(
+                self.current_image, method, return_fig=True
+            )
+            if fig is None:
+                ttk.Label(seg_window, text="No digits found to visualize").pack(padx=20, pady=20)
+                return
+
+            canvas = FigureCanvasTkAgg(fig, master=seg_window)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
             
         except Exception as e:
             print(f"Error showing segmentation visualization: {e}")

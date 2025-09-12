@@ -29,6 +29,10 @@ class ImageSegmenter:
         else:
             binary = ((1 - image) * 255).astype(np.uint8)
         
+        # Light morphological erosion to break thin joints between close digits
+        kernel = np.ones((2, 2), np.uint8)
+        binary = cv2.erode(binary, kernel, iterations=0)
+        
         # Find contours
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return contours
@@ -96,23 +100,131 @@ class ImageSegmenter:
             digits.append(resized_digit)
         
         return digits
+
+    def _to_binary_inv(self, image: np.ndarray) -> np.ndarray:
+        """Convert to inverted binary (digits as white)."""
+        if len(image.shape) == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if image.max() > 1:
+            _, binary = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY_INV)
+        else:
+            binary = ((1 - image) * 255).astype(np.uint8)
+        return binary
+
+    def split_box_by_vertical_projection(self, image: np.ndarray, box: Tuple[int, int, int, int],
+                                         smooth_window: int = 5, valley_ratio: float = 0.25,
+                                         min_width: int = 18) -> List[Tuple[int, int, int, int]]:
+        """
+        If a bounding box likely contains multiple touching digits, split it using
+        vertical projection (column histogram) to find a valley between digits.
+        Returns one or more boxes.
+        """
+        x, y, w, h = box
+        if w < min_width:
+            return [box]
+
+        binary = self._to_binary_inv(image)
+        roi = binary[y:y+h, x:x+w]
+        if roi.size == 0:
+            return [box]
+
+        col_sums = np.sum(roi > 0, axis=0).astype(np.float32)
+        if col_sums.size == 0 or np.max(col_sums) == 0:
+            return [box]
+
+        # Smooth the profile to reduce noise
+        kernel = np.ones((smooth_window,), dtype=np.float32) / float(smooth_window)
+        smoothed = np.convolve(col_sums, kernel, mode='same')
+        maxv = smoothed.max()
+        threshold = valley_ratio * maxv
+
+        # Candidate valley indices away from edges
+        margin = max(2, int(0.1 * w))
+        candidates = [i for i, v in enumerate(smoothed) if v < threshold and margin < i < (w - margin)]
+        if not candidates:
+            return [box]
+
+        # Choose the longest contiguous valley and split at its center
+        best_start = candidates[0]
+        best_end = candidates[0]
+        run_start = candidates[0]
+        prev = candidates[0]
+        best_len = 1
+        for idx in candidates[1:]:
+            if idx == prev + 1:
+                prev = idx
+            else:
+                run_len = prev - run_start + 1
+                if run_len > best_len:
+                    best_len = run_len
+                    best_start, best_end = run_start, prev
+                run_start = idx
+                prev = idx
+        # finalize last run
+        run_len = prev - run_start + 1
+        if run_len > best_len:
+            best_len = run_len
+            best_start, best_end = run_start, prev
+
+        split_at = int((best_start + best_end) / 2)
+        left_w = split_at
+        right_w = w - split_at
+
+        # Ensure both parts are reasonably wide
+        min_part = max(10, int(0.25 * w))
+        if left_w < min_part or right_w < min_part:
+            return [box]
+
+        left = (x, y, left_w, h)
+        right = (x + split_at, y, right_w, h)
+
+        result: List[Tuple[int, int, int, int]] = []
+        for b in (left, right):
+            # Recursively split if still very wide
+            aspect = b[2] / max(1, b[3])
+            if b[2] > 2 * min_width and aspect > 1.4:
+                result.extend(self.split_box_by_vertical_projection(image, b, smooth_window, valley_ratio, min_width))
+            else:
+                result.append(b)
+        return result
+
+    def split_wide_boxes(self, image: np.ndarray, boxes: List[Tuple[int, int, int, int]],
+                         aspect_threshold: float = 1.5) -> List[Tuple[int, int, int, int]]:
+        """Split boxes with large width:height aspect ratio using projection."""
+        final_boxes: List[Tuple[int, int, int, int]] = []
+        for box in boxes:
+            x, y, w, h = box
+            if h == 0:
+                continue
+            aspect = w / float(h)
+            if aspect > aspect_threshold and w > 20:
+                final_boxes.extend(self.split_box_by_vertical_projection(image, box))
+            else:
+                final_boxes.append(box)
+        # Sort left-to-right after splitting
+        final_boxes = self.sort_bounding_boxes_left_to_right(final_boxes)
+        return final_boxes
     
     def connected_components_segmentation(self, image: np.ndarray) -> List[np.ndarray]:
         """Segment digits using connected components analysis"""
         # Ensure binary image
         if len(image.shape) == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
+
         if image.max() > 1:
             _, binary = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY_INV)
         else:
             binary = ((1 - image) * 255).astype(np.uint8)
+
+        # Erosion disabled to preserve thin gaps in digits like '3'
+        kernel = np.ones((2, 2), np.uint8)
+        binary = cv2.erode(binary, kernel, iterations=0)
         
         # Find connected components
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
         
         digits = []
-        bounding_boxes = []
+        candidate_boxes = []
         
         # Process each component (skip background label 0)
         for i in range(1, num_labels):
@@ -122,31 +234,30 @@ class ImageSegmenter:
             if area < 20 or w < 3 or h < 3:
                 continue
             
-            # Extract component
-            component_mask = (labels == i).astype(np.uint8) * 255
-            digit_roi = component_mask[y:y+h, x:x+w]
-            
+            # Collect box for possible splitting later
+            candidate_boxes.append((x, y, w, h))
+
+        # Split wide boxes and then extract digits
+        final_boxes = self.split_wide_boxes(image, candidate_boxes)
+
+        for (x, y, w, h) in final_boxes:
+            component_mask = np.zeros_like(binary)
+            component_mask[y:y+h, x:x+w] = binary[y:y+h, x:x+w]
+
             # Add padding and resize
             max_dim = max(w, h)
             padded_size = int(max_dim * 1.2)
-            
+
             padded_digit = np.zeros((padded_size, padded_size), dtype=np.uint8)
             y_offset = (padded_size - h) // 2
             x_offset = (padded_size - w) // 2
-            padded_digit[y_offset:y_offset+h, x_offset:x_offset+w] = digit_roi
-            
+            padded_digit[y_offset:y_offset+h, x_offset:x_offset+w] = component_mask[y:y+h, x:x+w]
+
             # Resize to 28x28
             resized_digit = cv2.resize(padded_digit, (28, 28), interpolation=cv2.INTER_AREA)
-            
             digits.append(resized_digit)
-            bounding_boxes.append((x, y, w, h))
         
-        # Sort digits left to right
-        if bounding_boxes:
-            sorted_indices = sorted(range(len(bounding_boxes)), 
-                                  key=lambda i: bounding_boxes[i][0])
-            digits = [digits[i] for i in sorted_indices]
-        
+        # final_boxes is already left-to-right from split_wide_boxes
         return digits
     
     def contour_based_segmentation(self, image: np.ndarray) -> List[np.ndarray]:
@@ -159,6 +270,9 @@ class ImageSegmenter:
         
         # Get bounding boxes
         bounding_boxes = self.get_bounding_boxes(filtered_contours)
+
+        # Split wide boxes to handle touching digits
+        bounding_boxes = self.split_wide_boxes(image, bounding_boxes)
         
         # Sort left to right
         sorted_boxes = self.sort_bounding_boxes_left_to_right(bounding_boxes)
@@ -166,6 +280,90 @@ class ImageSegmenter:
         # Extract digits
         digits = self.extract_digits(image, sorted_boxes)
         
+        return digits
+
+    def projection_based_segmentation(self, image: np.ndarray) -> List[np.ndarray]:
+        """Segment digits using global vertical projection profile.
+
+        Works by computing the column-wise sum of foreground pixels,
+        smoothing it, and cutting at low-ink valleys to separate digits.
+        """
+        # Convert to inverted binary (digits white)
+        binary = self._to_binary_inv(image)
+
+        # Erosion disabled by default to avoid closing gaps
+        kernel = np.ones((2, 2), np.uint8)
+        binary = cv2.erode(binary, kernel, iterations=0)
+
+        # Compute vertical projection
+        col_sums = np.sum(binary > 0, axis=0).astype(np.float32)
+        if col_sums.size == 0:
+            return []
+
+        # Smooth profile
+        smooth_window = max(3, int(0.03 * len(col_sums)))
+        if smooth_window % 2 == 0:
+            smooth_window += 1
+        kernel = np.ones((smooth_window,), dtype=np.float32) / float(smooth_window)
+        smoothed = np.convolve(col_sums, kernel, mode='same')
+
+        # Determine valley threshold
+        maxv = smoothed.max() if smoothed.size else 0
+        threshold = 0.25 * maxv
+
+        # Find cut indices (runs where profile is below threshold)
+        w = binary.shape[1]
+        margin = max(3, int(0.05 * w))
+        cuts: List[int] = []
+        i = margin
+        while i < w - margin:
+            if smoothed[i] < threshold:
+                start = i
+                while i < w - margin and smoothed[i] < threshold:
+                    i += 1
+                end = i - 1
+                cut = int((start + end) / 2)
+                cuts.append(cut)
+            else:
+                i += 1
+
+        # Build segments from cuts
+        segments: List[Tuple[int, int]] = []
+        last = 0
+        min_width = max(12, int(0.12 * w))
+        for c in cuts:
+            if c - last >= min_width:
+                segments.append((last, c))
+                last = c
+        if w - last >= min_width:
+            segments.append((last, w))
+
+        # If no valid segments, return as one digit
+        if not segments:
+            segments = [(0, w)]
+
+        # Extract digit images per segment
+        digits: List[np.ndarray] = []
+        for x0, x1 in segments:
+            # Bounding box covering the full height where foreground exists
+            col = binary[:, x0:x1]
+            ys = np.where(np.any(col > 0, axis=1))[0]
+            if ys.size == 0:
+                continue
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            w_seg, h_seg = max(1, x1 - x0), max(1, y1 - y0)
+
+            # Create padded square image then resize to 28x28
+            max_dim = max(w_seg, h_seg)
+            padded_size = int(max_dim * 1.2)
+            padded_digit = np.zeros((padded_size, padded_size), dtype=np.uint8)
+            y_offset = (padded_size - h_seg) // 2
+            x_offset = (padded_size - w_seg) // 2
+            padded_digit[y_offset:y_offset+h_seg, x_offset:x_offset+w_seg] = binary[y0:y1, x0:x1]
+
+            resized_digit = cv2.resize(padded_digit, (28, 28), interpolation=cv2.INTER_AREA)
+            digits.append(resized_digit)
+
         return digits
     
     def segment_multi_digit_number(self, image: np.ndarray, method: str = 'contours') -> List[np.ndarray]:
@@ -181,14 +379,17 @@ class ImageSegmenter:
         """
         # Preprocess image for segmentation
         preprocessed = self.preprocessor.preprocess_pipeline(
-            image, 
-            steps=['grayscale', 'clahe', 'median', 'threshold', 'morphology']
+            image,
+            # Use closing instead of opening to preserve loops in 6/9
+            steps=['grayscale', 'clahe', 'median', 'threshold', 'morphology_close']
         )
         
         if method == 'contours':
             digits = self.contour_based_segmentation(preprocessed)
         elif method == 'connected_components':
             digits = self.connected_components_segmentation(preprocessed)
+        elif method in ('projection', 'projection_profile'):
+            digits = self.projection_based_segmentation(preprocessed)
         else:
             raise ValueError(f"Unknown segmentation method: {method}")
         
@@ -205,12 +406,19 @@ class ImageSegmenter:
             if normalized.mean() > 0.5:
                 normalized = 1.0 - normalized
             
+            # Center the digit using MNIST-style center-of-mass shifting
+            centered_u8 = self.preprocessor.mnist_center_of_mass((normalized * 255).astype(np.uint8))
+            normalized = centered_u8.astype(np.float32) / 255.0
+            
             normalized_digits.append(normalized)
         
         return normalized_digits
     
-    def visualize_segmentation(self, image: np.ndarray, method: str = 'contours') -> None:
-        """Visualize the segmentation process"""
+    def visualize_segmentation(self, image: np.ndarray, method: str = 'contours', return_fig: bool = False):
+        """Visualize the segmentation process.
+
+        If return_fig is True, returns the Matplotlib Figure instead of showing it.
+        """
         # Get preprocessed image
         preprocessed = self.preprocessor.preprocess_pipeline(
             image, 
@@ -224,7 +432,7 @@ class ImageSegmenter:
         num_digits = len(digits)
         if num_digits == 0:
             print("No digits found in image")
-            return
+            return None if return_fig else None
         
         fig, axes = plt.subplots(2, max(3, num_digits), figsize=(15, 8))
         
@@ -264,6 +472,8 @@ class ImageSegmenter:
                 axes[1, i].axis('off')
         
         plt.tight_layout()
+        if return_fig:
+            return fig
         plt.show()
     
     def merge_overlapping_boxes(self, bounding_boxes: List[Tuple[int, int, int, int]], 
@@ -320,23 +530,60 @@ class MultiDigitProcessor:
             # Default model loading
             try:
                 from models import CNNModel, SVMModel, RandomForestModel
+                import os
+                
+                # Resolve model paths (prefer project_root/models/, fallback to src/models/)
+                src_dir = os.path.dirname(os.path.abspath(__file__))
+                project_root = os.path.dirname(src_dir)
+                primary_models_dir = os.path.join(project_root, 'models')
+                fallback_models_dir = os.path.join(src_dir, 'models')
+
+                def find_model_path(filename):
+                    primary_path = os.path.join(primary_models_dir, filename)
+                    fallback_path = os.path.join(fallback_models_dir, filename)
+                    if os.path.exists(primary_path):
+                        return primary_path
+                    if os.path.exists(fallback_path):
+                        return fallback_path
+                    return None
+
+                # Prefer models trained on the combined dataset if present
+                def find_prefer_combined(basename: str) -> str | None:
+                    pref = [
+                        basename.replace('.', '_combined.'),
+                        basename,
+                    ]
+                    for name in pref:
+                        p = find_model_path(name)
+                        if p:
+                            return p
+                    return None
                 
                 # Load CNN model
                 cnn_model = CNNModel()
-                cnn_model.load_model('src/models/cnn_model.h5')
-                self.models['cnn'] = cnn_model
+                cnn_path = find_prefer_combined('cnn_model.h5')
+                if cnn_path:
+                    cnn_model.load_model(cnn_path)
+                    self.models['cnn'] = cnn_model
                 
                 # Load SVM model
                 svm_model = SVMModel()
-                svm_model.load_model('src/models/svm_model.pkl')
-                self.models['svm'] = svm_model
+                svm_path = find_prefer_combined('svm_model.pkl')
+                if svm_path:
+                    svm_model.load_model(svm_path)
+                    self.models['svm'] = svm_model
                 
                 # Load Random Forest model
                 rf_model = RandomForestModel()
-                rf_model.load_model('src/models/rf_model.pkl')
-                self.models['rf'] = rf_model
+                rf_path = find_prefer_combined('rf_model.pkl')
+                if rf_path:
+                    rf_model.load_model(rf_path)
+                    self.models['rf'] = rf_model
                 
-                print("Models loaded successfully")
+                if self.models:
+                    print("Models loaded successfully")
+                else:
+                    print("No trained models found. Train models first.")
                 
             except Exception as e:
                 print(f"Error loading models: {e}")
@@ -352,13 +599,58 @@ class MultiDigitProcessor:
         Returns:
             Tuple of (predicted_digit, confidence)
         """
-        if model_name not in self.models:
+        if model_name not in self.models or self.models.get(model_name) is None:
             raise ValueError(f"Model {model_name} not loaded")
-        
+
         model = self.models[model_name]
-        
-        # Use the predict method from our model classes
-        predictions, probabilities = model.predict(digit_image)
+
+        # Prepare Test-Time Augmentation: small rotations to stabilize 6/9
+        def rotate28(img: np.ndarray, angle: float) -> np.ndarray:
+            if img.ndim == 3 and img.shape[-1] == 1:
+                base = img[:, :, 0]
+            else:
+                base = img
+            M = cv2.getRotationMatrix2D((14, 14), angle, 1.0)
+            rotated = cv2.warpAffine((base * 255.0).astype(np.uint8), M, (28, 28),
+                                     flags=cv2.INTER_LINEAR, borderValue=0)
+            rot_f = rotated.astype(np.float32) / 255.0
+            if img.ndim == 3 and img.shape[-1] == 1:
+                rot_f = rot_f.reshape(28, 28, 1)
+            return rot_f
+
+        # Build a small set of variants
+        variants = [digit_image]
+        try:
+            variants.extend([
+                rotate28(digit_image, a) for a in (-10, -5, 5, 10)
+            ])
+        except Exception:
+            pass
+
+        # Accumulate probabilities across variants
+        prob_sum = None
+        last_pred = None
+        last_prob = None
+        for var in variants:
+            p_pred, p_prob = model.predict(var)
+            last_pred, last_prob = p_pred, p_prob
+            # Convert probability output to a flat 10-dim vector
+            if hasattr(p_prob, 'shape') and len(p_prob.shape) > 1:
+                vec = p_prob[0]
+            else:
+                vec = p_prob
+            vec = np.asarray(vec, dtype=np.float32)
+            if prob_sum is None:
+                prob_sum = vec
+            else:
+                prob_sum += vec
+
+        # Fallback in case model doesn't provide probabilities
+        if prob_sum is None:
+            predictions, probabilities = last_pred, last_prob
+        else:
+            probabilities = (prob_sum / float(len(variants))).reshape(1, -1)
+            predictions = [int(np.argmax(probabilities))]
         
         # Extract prediction and confidence
         if hasattr(predictions, '__len__') and len(predictions) > 0:
@@ -376,6 +668,43 @@ class MultiDigitProcessor:
             confidence = 1.0
         
         return int(predicted_digit), float(confidence)
+
+    def auto_select_segmentation(self, image: np.ndarray, model_name: str = 'cnn',
+                                 candidate_methods: list[str] | None = None):
+        """
+        Try multiple segmentation methods and pick the one with the highest
+        average confidence. By default compares only 'connected_components'
+        and 'projection' (excludes 'contours'). Returns
+        (number_string, predictions, digit_images, best_method, best_avg_conf).
+        """
+        if candidate_methods is None:
+            candidate_methods = ["connected_components", "projection"]
+
+        best = None  # tuple(avg_conf, method, number_string, predictions, images)
+
+        for method in candidate_methods:
+            digit_images = self.segmenter.segment_multi_digit_number(image, method)
+            if not digit_images:
+                continue
+            preds: list[tuple[int, float]] = []
+            try:
+                for dimg in digit_images:
+                    digit, conf = self.predict_single_digit(dimg, model_name)
+                    preds.append((digit, conf))
+            except Exception:
+                # If a model isn't available, skip method
+                continue
+
+            avg_conf = float(np.mean([c for _, c in preds])) if preds else 0.0
+            number_string = ''.join(str(p[0]) for p in preds)
+            if best is None or avg_conf > best[0]:
+                best = (avg_conf, method, number_string, preds, digit_images)
+
+        if best is None:
+            return "", [], [], "", 0.0
+
+        avg, method, number_string, preds, imgs = best
+        return number_string, preds, imgs, method, avg
     
     def process_multi_digit_number(self, image: np.ndarray, 
                                   model_name: str = 'cnn',

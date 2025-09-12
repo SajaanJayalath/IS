@@ -4,9 +4,21 @@ Implements CNN, SVM, and Random Forest models for digit classification
 """
 
 import numpy as np
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+# TensorFlow is optional for SVM/RF; guard its import to support environments
+# where TensorFlow is unavailable (e.g., Python 3.13). The CNN model will raise
+# a clear error when used without TensorFlow.
+try:
+    import tensorflow as tf  # type: ignore
+    from tensorflow import keras  # type: ignore
+    from tensorflow.keras import layers  # type: ignore
+    _TF_AVAILABLE = True
+    _TF_IMPORT_ERROR = None
+except Exception as _e:  # pragma: no cover - environment dependent
+    tf = None  # type: ignore
+    keras = None  # type: ignore
+    layers = None  # type: ignore
+    _TF_AVAILABLE = False
+    _TF_IMPORT_ERROR = _e
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
@@ -19,48 +31,93 @@ import seaborn as sns
 class CNNModel:
     """Convolutional Neural Network for digit recognition"""
     
-    def __init__(self, input_shape=(28, 28, 1), num_classes=10):
+    def __init__(self, input_shape=(28, 28, 1), num_classes=10,
+                 use_augmentation: bool = True,
+                 label_smoothing: float = 0.0):
         self.input_shape = input_shape
         self.num_classes = num_classes
         self.model = None
         self.history = None
+        self.use_augmentation = use_augmentation
+        self.label_smoothing = float(label_smoothing)
+        
+    def _ensure_tf(self):
+        """Ensure TensorFlow is available before using CNN features."""
+        if not _TF_AVAILABLE:
+            raise ImportError(
+                "TensorFlow is not available. The CNN model requires TensorFlow. "
+                "Install a compatible version (e.g., tensorflow==2.15.* on Python 3.10/3.11) "
+                f"or switch to SVM/Random Forest. Original import error: {_TF_IMPORT_ERROR}"
+            )
         
     def build_model(self):
         """Build CNN architecture optimized for MNIST digit recognition"""
+        self._ensure_tf()
+        aug_layers = []
+        if self.use_augmentation:
+            # Lightweight on-the-fly augmentation applied only during training
+            aug_layers = [
+                layers.Input(shape=self.input_shape),
+                layers.RandomRotation(0.08),
+                layers.RandomTranslation(0.05, 0.05),
+                layers.RandomZoom(0.10),
+                layers.RandomContrast(0.10),
+            ]
+
+        L2 = keras.regularizers.l2(1e-4)
+
         self.model = keras.Sequential([
+            *(aug_layers or [layers.Input(shape=self.input_shape)]),
             # First Convolutional Block
-            layers.Conv2D(32, (3, 3), activation='relu', input_shape=self.input_shape),
+            layers.Conv2D(32, (3, 3), activation='relu', kernel_regularizer=L2),
             layers.BatchNormalization(),
-            layers.Conv2D(32, (3, 3), activation='relu'),
+            layers.Conv2D(32, (3, 3), activation='relu', kernel_regularizer=L2),
             layers.MaxPooling2D((2, 2)),
             layers.Dropout(0.25),
             
             # Second Convolutional Block
-            layers.Conv2D(64, (3, 3), activation='relu'),
+            layers.Conv2D(64, (3, 3), activation='relu', kernel_regularizer=L2),
             layers.BatchNormalization(),
-            layers.Conv2D(64, (3, 3), activation='relu'),
+            layers.Conv2D(64, (3, 3), activation='relu', kernel_regularizer=L2),
             layers.MaxPooling2D((2, 2)),
             layers.Dropout(0.25),
             
             # Third Convolutional Block
-            layers.Conv2D(128, (3, 3), activation='relu'),
+            layers.Conv2D(128, (3, 3), activation='relu', kernel_regularizer=L2),
             layers.BatchNormalization(),
             layers.Dropout(0.25),
             
             # Dense Layers
             layers.Flatten(),
-            layers.Dense(512, activation='relu'),
+            layers.Dense(512, activation='relu', kernel_regularizer=L2),
             layers.BatchNormalization(),
             layers.Dropout(0.5),
-            layers.Dense(256, activation='relu'),
+            layers.Dense(256, activation='relu', kernel_regularizer=L2),
             layers.Dropout(0.5),
             layers.Dense(self.num_classes, activation='softmax')
         ])
         
         # Compile model
+        # Loss: prefer SparseCategoricalCrossentropy; add label_smoothing only if supported
+        loss_obj: any
+        try:
+            import inspect  # type: ignore
+            supports_ls = 'label_smoothing' in inspect.signature(
+                keras.losses.SparseCategoricalCrossentropy.__init__  # type: ignore
+            ).parameters
+        except Exception:
+            supports_ls = False
+
+        if self.label_smoothing > 0 and supports_ls:
+            loss_obj = keras.losses.SparseCategoricalCrossentropy(label_smoothing=self.label_smoothing)
+        else:
+            if self.label_smoothing > 0 and not supports_ls:
+                print("Warning: label_smoothing not supported for SparseCategoricalCrossentropy in this Keras version; using standard loss.")
+            loss_obj = 'sparse_categorical_crossentropy'
+
         self.model.compile(
             optimizer='adam',
-            loss='sparse_categorical_crossentropy',
+            loss=loss_obj,
             metrics=['accuracy']
         )
         
@@ -68,6 +125,7 @@ class CNNModel:
     
     def train(self, X_train, y_train, X_val=None, y_val=None, epochs=20, batch_size=128):
         """Train the CNN model"""
+        self._ensure_tf()
         if self.model is None:
             self.build_model()
         
@@ -93,6 +151,7 @@ class CNNModel:
     
     def evaluate(self, X_test, y_test):
         """Evaluate model performance"""
+        self._ensure_tf()
         if self.model is None:
             raise ValueError("Model not trained yet!")
         
@@ -115,16 +174,19 @@ class CNNModel:
     
     def save_model(self, filepath):
         """Save trained model"""
+        self._ensure_tf()
         if self.model is None:
             raise ValueError("No model to save!")
         self.model.save(filepath)
     
     def load_model(self, filepath):
         """Load trained model"""
+        self._ensure_tf()
         self.model = keras.models.load_model(filepath)
     
     def predict(self, X):
         """Make predictions on input data"""
+        self._ensure_tf()
         if self.model is None:
             raise ValueError("Model not trained or loaded yet!")
         
@@ -139,6 +201,7 @@ class CNNModel:
     
     def plot_training_history(self):
         """Plot training history"""
+        self._ensure_tf()
         if self.history is None:
             print("No training history available!")
             return
@@ -381,28 +444,31 @@ class ModelComparison:
         plt.tight_layout()
         plt.show()
 
-# Test function
+# Test function (skips CNN if TF unavailable)
 if __name__ == "__main__":
     print("Testing model implementations...")
-    
+
     # Create dummy data for testing
     X_dummy = np.random.random((100, 28, 28, 1))
     y_dummy = np.random.randint(0, 10, 100)
-    
-    # Test CNN
+
+    # Test CNN (only if TF is available)
     print("\nTesting CNN...")
-    cnn = CNNModel()
-    cnn.build_model()
-    print("CNN model built successfully!")
-    
+    try:
+        cnn = CNNModel()
+        cnn.build_model()
+        print("CNN model built successfully!")
+    except Exception as e:
+        print(f"Skipping CNN test: {e}")
+
     # Test SVM
     print("\nTesting SVM...")
     svm = SVMModel()
     print("SVM model initialized successfully!")
-    
+
     # Test Random Forest
     print("\nTesting Random Forest...")
     rf = RandomForestModel()
     print("Random Forest model initialized successfully!")
-    
-    print("\nAll model classes implemented successfully!")
+
+    print("\nAll model classes imported successfully!")
