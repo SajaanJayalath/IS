@@ -1,24 +1,24 @@
 # Core dependencies for HNRS project
-numpy>=1.21.0
-pandas>=1.3.0
-matplotlib>=3.4.0
-scikit-learn>=1.0.0
-opencv-python>=4.5.0
-Pillow>=8.3.0
+numpy
+pandas
+matplotlib
+scikit-learn
+opencv-python
+Pillow
 
 # Deep Learning frameworks
-tensorflow>=2.8.0
-torch>=1.11.0
-torchvision>=0.12.0
+tensorflow
+torch
+torchvision
 
 # GUI framework (tkinter is built-in with Python)
 # tkinter - built-in module
 
 # Additional utilities
-seaborn>=0.11.0
-jupyter>=1.0.0
-ipykernel>=6.0.0
+seaborn
+jupyter
+ipykernel
 
 # Testing
-pytest>=6.0.0
-pytest-cov>=2.12.0
+pytest
+pytest-cov
