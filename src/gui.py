@@ -21,6 +21,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from models import CNNModel, SVMModel, RandomForestModel
 from image_preprocessing import ImagePreprocessor, preprocess_for_mnist_model, prepare_for_character_model
 from image_segmentation import ImageSegmenter, MultiDigitProcessor
+from letters_new import LettersPipeline
 
 class DrawingCanvas:
     """Canvas for drawing handwritten characters"""
@@ -95,6 +96,7 @@ class HNRSApplication:
         self.preprocessor = ImagePreprocessor()
         self.segmenter = ImageSegmenter()
         self.multi_digit_processor = MultiDigitProcessor()
+        self.letter_pipeline = LettersPipeline()
         self.models = {}
         self.last_auto_seg_method: str | None = None
 
@@ -106,7 +108,7 @@ class HNRSApplication:
             },
             "letters": {
                 "label": "Letters (A-Z, a-z)",
-                "dataset": "nist_by_class",
+                "dataset": "letters_new",
                 "allowed_type": "letters",
             },
         }
@@ -157,6 +159,7 @@ class HNRSApplication:
                 self.active_label_mapping = label_mapping
                 allowed_chars = self._allowed_characters_for_mode(mode_key, label_mapping)
                 self._configure_multi_digit_models(label_mapping, allowed_chars, config.get("allowed_type"))
+                self._configure_letter_pipeline(mode_key, allowed_chars)
                 self._refresh_model_selector()
                 return
 
@@ -176,7 +179,7 @@ class HNRSApplication:
                 return ordered
 
             loaded_models: Dict[str, Any] = {}
-            model_specs = [
+            model_specs = [] if dataset == "letters_new" else [
                 ("CNN", CNNModel, "cnn_model.h5"),
                 ("SVM", SVMModel, "svm_model.pkl"),
                 ("Random Forest", RandomForestModel, "rf_model.pkl"),
@@ -201,9 +204,7 @@ class HNRSApplication:
                 print(f"Loaded {display_name} model from {model_path}")
 
             self.models = loaded_models
-            label_mapping = self._load_label_mapping_for_dataset(
-                dataset, [primary_models_dir, fallback_models_dir]
-            )
+            label_mapping = {}
             self.active_mode = mode_key
             self.active_dataset = dataset
             self.active_label_mapping = label_mapping
@@ -214,6 +215,7 @@ class HNRSApplication:
 
             allowed_chars = self._allowed_characters_for_mode(mode_key, label_mapping)
             self._configure_multi_digit_models(label_mapping, allowed_chars, config.get("allowed_type"))
+            self._configure_letter_pipeline(mode_key, allowed_chars)
 
             self._refresh_model_selector()
             if hasattr(self, "status_var"):
@@ -301,6 +303,58 @@ class HNRSApplication:
             self.multi_digit_processor.models["ensemble"] = dict(base_models)
         else:
             self.multi_digit_processor.models.pop("ensemble", None)
+
+    def _configure_letter_pipeline(self, mode_key: str, allowed_chars: set[str] | None) -> None:
+        if mode_key != "letters":
+            return
+        if not self.models or not self.active_label_mapping:
+            return
+        # new pipeline loads and manages its own model; nothing to configure
+        return
+
+    def _run_letter_recognition(
+        self,
+        model_display: str,
+        segmentation_method: str,
+        selection_raw: str,
+    ) -> tuple[str, list[tuple[str, float]], list[np.ndarray], str]:
+        try:
+            text, predictions, processed_imgs, method_used = self.letter_pipeline.process_image(
+                self.current_image, model_display, segmentation_method
+            )
+        except Exception as exc:
+            messagebox.showerror("Letter Recognition Error", f"Error processing letter input: {exc}")
+            raise
+
+        method_display = method_used or selection_raw
+
+        if method_used.lower().startswith("auto"):
+            auto_method = method_used.split("->", 1)[-1].strip()
+            self.last_auto_seg_method = auto_method if auto_method else None
+        else:
+            self.last_auto_seg_method = segmentation_method
+
+        digit_images: list[np.ndarray] = []
+        for img in processed_imgs:
+            arr = np.asarray(img)
+            if arr.ndim == 2:
+                base = arr
+            else:
+                base = arr.reshape(arr.shape[0], arr.shape[1])
+            if base.max() <= 1.0:
+                base = (base * 255).astype(np.uint8)
+            else:
+                base = base.astype(np.uint8)
+            digit_images.append(base)
+
+        if not digit_images and text:
+            prepared = prepare_for_character_model(self.current_image)
+            base = prepared.squeeze()
+            if base.max() <= 1.0:
+                base = (base * 255).astype(np.uint8)
+            digit_images = [base]
+
+        return text, predictions, digit_images, method_display
     def _refresh_model_selector(self) -> None:
         if not hasattr(self, "model_var") or not hasattr(self, "model_combo"):
             return
@@ -519,38 +573,49 @@ class HNRSApplication:
         try:
             self.update_status("Processing image...")
             
-            # Get selected model and segmentation method
-            model_name = self.model_var.get().lower().replace(' ', '_')
-            if model_name == 'random_forest':
-                model_name = 'rf'
-
-            # Ensure the selected model is actually loaded
-            if model_name not in self.multi_digit_processor.models or \
-               self.multi_digit_processor.models.get(model_name) is None:
-                messagebox.showerror(
-                    "Model Not Loaded",
-                    "The selected model is not loaded. Please train or load models first."
-                )
-                self.update_status("Model not loaded")
+            model_display = self.model_var.get()
+            if not model_display:
+                messagebox.showerror("Model Not Selected", "Please select a model before processing.")
+                self.update_status("Model not selected")
                 return
 
             selection_raw = self.segmentation_var.get()
             segmentation_method = selection_raw.lower().replace(' ', '_')
 
-            # Process multi-digit number (with optional auto selection)
-            used_method_display = selection_raw
-            if segmentation_method == 'auto_selection':
-                number_string, predictions, digit_images, used_method, _ = self.multi_digit_processor.auto_select_segmentation(
-                    self.current_image, model_name
-                )
-                used_method_display = f"Auto -> {used_method}" if used_method else "Auto -> none"
-                self.last_auto_seg_method = used_method
+            if self.active_mode == "letters":
+                text, preds, imgs = self.letter_pipeline.recognize(self.current_image,
+                                                                   'cc' if segmentation_method == 'auto_selection' else segmentation_method)
+                number_string, predictions, digit_images = text, preds, imgs
+                used_method_display = selection_raw
             else:
-                number_string, predictions, digit_images = self.multi_digit_processor.process_multi_digit_number(
-                    self.current_image, model_name, segmentation_method
-                )
-                used_method = segmentation_method
-                self.last_auto_seg_method = segmentation_method
+                model_name = model_display.lower().replace(' ', '_')
+                if model_name == 'random_forest':
+                    model_name = 'rf'
+
+                # Ensure the selected model is actually loaded
+                if model_name not in self.multi_digit_processor.models or \
+                   self.multi_digit_processor.models.get(model_name) is None:
+                    messagebox.showerror(
+                        "Model Not Loaded",
+                        "The selected model is not loaded. Please train or load models first."
+                    )
+                    self.update_status("Model not loaded")
+                    return
+
+                # Process multi-digit number (with optional auto selection)
+                used_method_display = selection_raw
+                if segmentation_method == 'auto_selection':
+                    number_string, predictions, digit_images, used_method, _ = self.multi_digit_processor.auto_select_segmentation(
+                        self.current_image, model_name
+                    )
+                    used_method_display = f"Auto -> {used_method}" if used_method else "Auto -> none"
+                    self.last_auto_seg_method = used_method
+                else:
+                    number_string, predictions, digit_images = self.multi_digit_processor.process_multi_digit_number(
+                        self.current_image, model_name, segmentation_method
+                    )
+                    used_method = segmentation_method
+                    self.last_auto_seg_method = segmentation_method
             
             # Display results
             self.display_results(number_string, predictions, digit_images, used_method_display)
@@ -616,8 +681,27 @@ class HNRSApplication:
             
             selection_raw = self.segmentation_var.get()
             segmentation_method = selection_raw.lower().replace(' ', '_')
-            
-            # Test each model
+
+            if self.active_mode == "letters":
+                for model_display_name, model_obj in self.models.items():
+                    if model_obj is None:
+                        self.results_text.insert(tk.END, f"{model_display_name} Model: Not loaded\n\n")
+                        continue
+                    try:
+                        number_string, predictions, _, seg_used = self.letter_pipeline.process_image(
+                            self.current_image, model_display_name, segmentation_method
+                        )
+                        avg_confidence = np.mean([conf for _, conf in predictions]) if predictions else 0
+                        self.results_text.insert(tk.END, f"{model_display_name} Model:\n")
+                        self.results_text.insert(tk.END, f"  Result: {number_string}\n")
+                        self.results_text.insert(tk.END, f"  Avg Confidence: {avg_confidence:.3f}\n")
+                        self.results_text.insert(tk.END, f"  Segmentation: {seg_used}\n")
+                        self.results_text.insert(tk.END, f"  Individual: {[pred[0] for pred in predictions]}\n\n")
+                    except Exception as e:
+                        self.results_text.insert(tk.END, f"{model_display_name} Model: Error - {e}\n\n")
+                return
+
+            # Digit comparison (original pipeline)
             for model_display_name, model_key in [('CNN', 'cnn'), ('SVM', 'svm'), ('Random Forest', 'rf')]:
                 if model_key in self.multi_digit_processor.models and self.multi_digit_processor.models[model_key]:
                     try:
@@ -644,7 +728,7 @@ class HNRSApplication:
                         self.results_text.insert(tk.END, f"{model_display_name} Model: Error - {e}\n\n")
                 else:
                     self.results_text.insert(tk.END, f"{model_display_name} Model: Not loaded\n\n")
-            
+
             self.update_status("Model comparison complete")
             
         except Exception as e:
@@ -661,6 +745,26 @@ class HNRSApplication:
             model_name = self.model_var.get().lower().replace(' ', '_')
             if model_name == 'random_forest':
                 model_name = 'rf'
+
+            if self.active_mode == "letters":
+                methods = ["contours", "connected_components", "projection"]
+                self.results_text.delete(1.0, tk.END)
+                self.results_text.insert(tk.END, "SEGMENTATION METHOD COMPARISON\n")
+                self.results_text.insert(tk.END, "="*50 + "\n\n")
+
+                for m in methods:
+                    try:
+                        number_string, predictions, _, _ = self.letter_pipeline.process_image(
+                            self.current_image, self.model_var.get(), m
+                        )
+                        avg_conf = np.mean([c for _, c in predictions]) if predictions else 0
+                        chars = [p[0] for p in predictions]
+                        self.results_text.insert(tk.END, f"{m}: {number_string}  | characters: {chars}  | avg: {avg_conf:.3f}\n")
+                    except Exception as e:
+                        self.results_text.insert(tk.END, f"{m}: Error - {e}\n")
+
+                self.update_status("Segmentation methods compared")
+                return
 
             if model_name not in self.multi_digit_processor.models or \
                self.multi_digit_processor.models.get(model_name) is None:
@@ -853,4 +957,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

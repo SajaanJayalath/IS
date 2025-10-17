@@ -12,6 +12,8 @@ Both loaders expose a similar API:
 
 import os
 import glob
+import sys
+import time
 from typing import Tuple, Optional, List, Dict
 
 import pandas as pd
@@ -467,12 +469,26 @@ class NISTByClassLoader:
         rng = np.random.default_rng(self.random_state)
         for char, paths in class_entries:
             limit = self.max_per_class if self.max_per_class else None
-            if limit and len(paths) > limit:
-                print(f"Class {char}: sampling {limit} of {len(paths)} images")
+            total_in_class = len(paths)
+            if limit and total_in_class > limit:
+                print(f"Class {char}: sampling {limit} of {total_in_class} images")
                 paths = list(rng.choice(paths, size=limit, replace=False))
-            for path in paths:
-                X_list.append(self._read_and_preprocess(path))
-                y_list.append(self.char_to_index[char])
+            else:
+                print(f"Class {char}: loading {total_in_class} images")
+            sys.stdout.flush()
+
+            start_t = time.time()
+            for idx, path in enumerate(paths, 1):
+                try:
+                    X_list.append(self._read_and_preprocess(path))
+                    y_list.append(self.char_to_index[char])
+                except Exception:
+                    continue
+
+                if idx % 500 == 0 or idx == len(paths):
+                    elapsed = time.time() - start_t
+                    print(f"  > {char}: {idx}/{len(paths)} processed in {elapsed:.1f}s")
+                    sys.stdout.flush()
         if not X_list:
             raise FileNotFoundError("No images were loaded from the NIST dataset")
         X = np.stack(X_list, axis=0).astype(np.float32)
