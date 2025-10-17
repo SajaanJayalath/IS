@@ -39,10 +39,10 @@ def test_single_image(image_path, model_name='cnn'):
         )
         
         if number_string:
-            print(f"Recognized number: {number_string}")
+            print(f"Recognized text: {number_string}")
             print("Individual predictions:")
             for i, (digit, confidence) in enumerate(predictions):
-                print(f"  Digit {i+1}: {digit} (confidence: {confidence:.3f})")
+                print(f"  Character {i+1}: {digit} (confidence: {confidence:.3f})")
         else:
             print("No digits detected in image")
             
@@ -158,7 +158,7 @@ def main():
     parser = argparse.ArgumentParser(description="Handwritten Number Recognition System")
     parser.add_argument('--gui', action='store_true', help='Launch GUI application')
     parser.add_argument('--test-image', type=str, help='Test recognition on single image')
-    parser.add_argument('--model', type=str, choices=['cnn', 'svm', 'rf'], 
+    parser.add_argument('--model', type=str, choices=['cnn', 'svm', 'rf', 'ensemble'], 
                        default='cnn', help='Model to use for recognition')
     parser.add_argument('--test-models', action='store_true', help='Test model loading and basic functionality')
     parser.add_argument('--check-deps', action='store_true', help='Check if all dependencies are installed')

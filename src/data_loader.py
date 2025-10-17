@@ -12,7 +12,7 @@ Both loaders expose a similar API:
 
 import os
 import glob
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
 
 import pandas as pd
 import numpy as np
@@ -41,6 +41,7 @@ class MNISTDataLoader:
         self.X_test = None
         self.y_test = None
         self.scaler = StandardScaler()
+        self.class_names = [str(i) for i in range(10)]
         
     def load_data(self):
         """
@@ -71,6 +72,8 @@ class MNISTDataLoader:
         
         self.X_test = self.test_data.iloc[:, 1:].values
         self.y_test = self.test_data.iloc[:, 0].values
+        unique_labels = np.unique(np.concatenate([self.y_train, self.y_test]))
+        self.class_names = [str(int(lbl)) for lbl in unique_labels]
         
         print(f"X_train shape: {self.X_train.shape}")
         print(f"y_train shape: {self.y_train.shape}")
@@ -188,6 +191,13 @@ class MNISTDataLoader:
         
         return X_train_split, X_val, y_train_split, y_val
 
+    def get_label_mapping(self) -> Dict[int, str]:
+        if self.y_train is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        labels = np.unique(np.concatenate([self.y_train, self.y_test]))
+        return {int(lbl): str(int(lbl)) for lbl in labels}
+
+
 
 class ImageFolderDataLoader:
     """
@@ -216,6 +226,7 @@ class ImageFolderDataLoader:
         self.y_train: Optional[np.ndarray] = None
         self.X_test: Optional[np.ndarray] = None
         self.y_test: Optional[np.ndarray] = None
+        self.class_names: Optional[List[str]] = None
 
     def _collect_files(self, split: str) -> List[Tuple[str, int]]:
         split_dir = os.path.join(self.root_dir, split)
@@ -288,6 +299,8 @@ class ImageFolderDataLoader:
 
         self.X_train, self.y_train = X_train, y_train
         self.X_test, self.y_test = X_test, y_test
+        combined = np.concatenate([self.y_train, self.y_test]) if self.y_test.size else self.y_train
+        self.class_names = [str(int(lbl)) for lbl in sorted(np.unique(combined))]
 
         print(f"Training data shape: {self.X_train.shape}")
         print(f"Test data shape: {self.X_test.shape}")
@@ -337,6 +350,201 @@ class ImageFolderDataLoader:
             print(f"Visualization saved to {save_path}")
         plt.show()
 
+    def get_label_mapping(self) -> Dict[int, str]:
+        if self.y_train is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        combined = np.concatenate([self.y_train, self.y_test]) if self.y_test is not None else self.y_train
+        return {int(lbl): str(int(lbl)) for lbl in np.unique(combined)}
+
+
+
+
+class NISTByClassLoader:
+    '''Loader for NIST Special Database 19 'by_class' digit/character folders.'''
+
+    IMG_SUFFIXES = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+
+    def __init__(
+        self,
+        root_dir: str,
+        image_size: int = 28,
+        include_digits: bool = True,
+        include_uppercase: bool = True,
+        include_lowercase: bool = True,
+        max_per_class: Optional[int] = 10000,
+        test_size: float = 0.2,
+        random_state: int = 42,
+    ):
+        self.root_dir = root_dir
+        self.image_size = image_size
+        self.include_digits = include_digits
+        self.include_uppercase = include_uppercase
+        self.include_lowercase = include_lowercase
+        self.max_per_class = max_per_class
+        self.test_size = test_size
+        self.random_state = random_state
+        self.X_train: Optional[np.ndarray] = None
+        self.y_train: Optional[np.ndarray] = None
+        self.X_test: Optional[np.ndarray] = None
+        self.y_test: Optional[np.ndarray] = None
+        self.class_names: Optional[List[str]] = None
+        self.char_to_index: Dict[str, int] = {}
+        self.index_to_char: Dict[int, str] = {}
+
+    def _hex_to_char(self, folder_name: str) -> Optional[str]:
+        try:
+            code_point = int(folder_name, 16)
+        except ValueError:
+            return None
+        char = chr(code_point)
+        if char.isdigit():
+            return char if self.include_digits else None
+        if 'A' <= char <= 'Z':
+            return char if self.include_uppercase else None
+        if 'a' <= char <= 'z':
+            return char if self.include_lowercase else None
+        return None
+
+    def _iter_image_paths(self, class_dir: str) -> List[str]:
+        paths: List[str] = []
+        for root, _, files in os.walk(class_dir):
+            for fname in files:
+                if fname.lower().endswith(self.IMG_SUFFIXES):
+                    paths.append(os.path.join(root, fname))
+        return paths
+
+    def _read_and_preprocess(self, path: str) -> np.ndarray:
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise ValueError(f"Failed to read image: {path}")
+        h, w = img.shape[:2]
+        border = np.concatenate([img[0, :], img[-1, :], img[:, 0], img[:, -1]])
+        if border.mean() < img[h // 4: 3 * h // 4, w // 4: 3 * w // 4].mean():
+            img = 255 - img
+        target = self.image_size
+        scale = min(target / w, target / h)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        canvas = np.zeros((target, target), dtype=np.uint8)
+        y0 = (target - new_h) // 2
+        x0 = (target - new_w) // 2
+        canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+        return canvas.reshape(-1)
+
+    def _class_sort_key(self, char: str) -> tuple[int, int]:
+        if char.isdigit():
+            return (0, ord(char))
+        if 'A' <= char <= 'Z':
+            return (1, ord(char))
+        if 'a' <= char <= 'z':
+            return (2, ord(char))
+        return (3, ord(char))
+
+    def load_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if not os.path.isdir(self.root_dir):
+            raise FileNotFoundError(f"Dataset directory not found: {self.root_dir}")
+        class_entries = []
+        for folder in sorted(os.listdir(self.root_dir)):
+            char = self._hex_to_char(folder)
+            if not char:
+                continue
+            class_dir = os.path.join(self.root_dir, folder)
+            if not os.path.isdir(class_dir):
+                continue
+            paths = self._iter_image_paths(class_dir)
+            if not paths:
+                continue
+            class_entries.append((char, paths))
+        if not class_entries:
+            raise FileNotFoundError(f"No usable classes found under {self.root_dir}")
+        class_entries.sort(key=lambda item: self._class_sort_key(item[0]))
+        self.class_names = [char for char, _ in class_entries]
+        self.char_to_index = {char: idx for idx, char in enumerate(self.class_names)}
+        self.index_to_char = {idx: char for char, idx in self.char_to_index.items()}
+        X_list: List[np.ndarray] = []
+        y_list: List[int] = []
+        rng = np.random.default_rng(self.random_state)
+        for char, paths in class_entries:
+            limit = self.max_per_class if self.max_per_class else None
+            if limit and len(paths) > limit:
+                print(f"Class {char}: sampling {limit} of {len(paths)} images")
+                paths = list(rng.choice(paths, size=limit, replace=False))
+            for path in paths:
+                X_list.append(self._read_and_preprocess(path))
+                y_list.append(self.char_to_index[char])
+        if not X_list:
+            raise FileNotFoundError("No images were loaded from the NIST dataset")
+        X = np.stack(X_list, axis=0).astype(np.float32)
+        y = np.array(y_list, dtype=np.int64)
+        if not (0.0 < self.test_size < 1.0):
+            raise ValueError("test_size must be between 0 and 1")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=self.test_size,
+            random_state=self.random_state,
+            stratify=y,
+        )
+        self.X_train, self.y_train = X_train, y_train
+        self.X_test, self.y_test = X_test, y_test
+        print(
+            f"NIST by_class dataset loaded: {self.X_train.shape[0]} train / "
+            f"{self.X_test.shape[0]} test samples across {len(self.class_names)} classes"
+        )
+        return self.X_train, self.y_train, self.X_test, self.y_test
+
+    def preprocess_data(self, normalize: bool = True, reshape_for_cnn: bool = False):
+        if self.X_train is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        X_train = self.X_train.copy()
+        X_test = self.X_test.copy()
+        if normalize:
+            X_train = X_train.astype('float32') / 255.0
+            X_test = X_test.astype('float32') / 255.0
+        if reshape_for_cnn:
+            X_train = X_train.reshape(-1, self.image_size, self.image_size, 1)
+            X_test = X_test.reshape(-1, self.image_size, self.image_size, 1)
+        return X_train, self.y_train, X_test, self.y_test
+
+    def get_class_distribution(self):
+        if self.y_train is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        train_counts = pd.Series(self.y_train).value_counts().sort_index()
+        test_counts = pd.Series(self.y_test).value_counts().sort_index()
+
+        def _convert(series):
+            return {self.index_to_char[int(idx)]: int(series[idx]) for idx in series.index}
+
+        return {
+            'train': _convert(train_counts),
+            'test': _convert(test_counts),
+        }
+
+    def visualize_samples(self, num_samples: int = 10, save_path: Optional[str] = None):
+        if self.X_train is None:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        samples = min(num_samples, len(self.X_train))
+        indices = np.random.choice(len(self.X_train), samples, replace=False)
+        fig, axes = plt.subplots(1, samples, figsize=(samples * 2, 2))
+        if samples == 1:
+            axes = [axes]
+        for ax, idx in zip(axes, indices):
+            image = self.X_train[idx].reshape(self.image_size, self.image_size)
+            label = self.index_to_char[int(self.y_train[idx])]
+            ax.imshow(image, cmap='gray')
+            ax.set_title(label)
+            ax.axis('off')
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Visualization saved to {save_path}")
+        plt.show()
+
+    def get_label_mapping(self) -> Dict[int, str]:
+        if not self.index_to_char:
+            raise ValueError("Data not loaded. Call load_data() first.")
+        return dict(self.index_to_char)
 
 class _TorchvisionBase:
     """Common helpers for torchvision-backed datasets."""
@@ -537,7 +745,7 @@ class CombinedDataLoader:
         }
 
 
-def get_data_loader(dataset: str, data_dir: Optional[str] = None):
+def get_data_loader(dataset: str, data_dir: Optional[str] = None, **loader_kwargs):
     """
     Factory for dataset loaders.
 
@@ -545,6 +753,7 @@ def get_data_loader(dataset: str, data_dir: Optional[str] = None):
     - dataset == 'image_folder': expects class subfolders 0..9 under train/ and optional test/
     - dataset == 'emnist_digits': downloads EMNIST digits via torchvision
     - dataset == 'svhn': downloads SVHN via torchvision
+    - dataset == 'nist_by_class': expects NIST SD19 by_class directories (hex ASCII)
     - dataset == 'combined': concatenates MNIST CSV + EMNIST(digits) + SVHN (balanced sample)
     """
     dataset = (dataset or 'mnist_csv').lower()
@@ -558,6 +767,9 @@ def get_data_loader(dataset: str, data_dir: Optional[str] = None):
         return EMNISTDigitsLoader(root_dir=data_dir or os.path.join('data', 'emnist'))
     elif dataset == 'svhn':
         return SVHNLoader(root_dir=data_dir or os.path.join('data', 'svhn'))
+    elif dataset == 'nist_by_class':
+        root = data_dir or os.path.join('data', 'by_class', 'by_class')
+        return NISTByClassLoader(root_dir=root, **loader_kwargs)
     elif dataset == 'combined':
         return CombinedDataLoader()
     else:

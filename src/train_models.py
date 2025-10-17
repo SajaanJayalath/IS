@@ -27,39 +27,71 @@ def create_models_directory(models_dir: str):
         os.makedirs(models_dir)
         print("Created 'models' directory for saving trained models")
 
-def train_all_models(dataset: str = 'mnist_csv', data_dir: str | None = None, epochs: int = 10, subset_size: int = 10000):
+def train_all_models(
+    dataset: str = 'mnist_csv',
+    data_dir: str | None = None,
+    epochs: int = 10,
+    subset_size: int = 10000,
+    include_lowercase: bool = True,
+    max_per_class: int | None = None,
+):
     """Train and evaluate all models
 
     Args:
-        dataset: 'mnist_csv' or 'image_folder'
+        dataset: dataset identifier (e.g., 'mnist_csv', 'image_folder', 'nist_by_class')
         data_dir: path to dataset root (required for image_folder)
         epochs: CNN training epochs
         subset_size: number of samples for SVM/RF speed-up
+        include_lowercase: when using nist_by_class, include lowercase characters
+        max_per_class: optional limit per character class for nist_by_class
     """
     print("="*60)
     print("HANDWRITTEN NUMBER RECOGNITION SYSTEM - MODEL TRAINING")
     print("="*60)
     
     # Resolve paths and create models directory
-    project_root, models_dir, data_dir = _project_paths()
+    project_root, models_dir, default_mnist_dir = _project_paths()
     create_models_directory(models_dir)
-    
+
     # Load data
     print("\n1. Loading data...")
     if dataset == 'mnist_csv':
-        # project-rooted MNIST_CSV directory by default
-        _project_root, _models_dir, default_data_dir = _project_paths()
-        use_dir = data_dir or default_data_dir
+        use_dir = data_dir or default_mnist_dir
     else:
-        use_dir = data_dir  # image_folder requires explicit path
+        use_dir = data_dir  # other loaders expect explicit path
 
-    data_loader = get_data_loader(dataset, use_dir)
+    loader_kwargs = {}
+    if dataset == "nist_by_class":
+        loader_kwargs["include_lowercase"] = include_lowercase
+        if max_per_class is not None:
+            loader_kwargs["max_per_class"] = max_per_class
+    data_loader = get_data_loader(dataset, use_dir, **loader_kwargs)
     
     # Load training and test data
     X_train, y_train, X_test, y_test = data_loader.load_data()
     
-    print(f"Training data shape: {X_train.shape}")
-    print(f"Test data shape: {X_test.shape}")
+    label_mapping = None
+    class_names = None
+    if hasattr(data_loader, "get_label_mapping"):
+        try:
+            raw_mapping = data_loader.get_label_mapping()
+            label_mapping = {int(k): str(v) for k, v in raw_mapping.items()}
+        except Exception as err:
+            print(f"Warning: could not retrieve label mapping from loader: {err}")
+    if label_mapping is None:
+        if y_test is not None and len(y_test):
+            unique_labels = np.unique(np.concatenate([y_train, y_test]))
+        else:
+            unique_labels = np.unique(y_train)
+        label_mapping = {int(lbl): str(int(lbl)) for lbl in unique_labels}
+    class_names = [label_mapping[idx] for idx in sorted(label_mapping)]
+    num_classes = len(class_names)
+    print(f"Detected {num_classes} classes.")
+    if num_classes <= 64:
+        print(f"Class labels: {' '.join(class_names)}")
+    else:
+        preview = ' '.join(class_names[:32])
+        print(f"Class labels (first 32): {preview} ...")
     
     # Preprocess data
     print("\n2. Preprocessing data...")
@@ -89,7 +121,7 @@ def train_all_models(dataset: str = 'mnist_csv', data_dir: str | None = None, ep
     print("="*50)
     
     start_time = time.time()
-    cnn_model = CNNModel()
+    cnn_model = CNNModel(num_classes=num_classes, class_names=class_names)
     
     # Train CNN
     cnn_history = cnn_model.train(
@@ -237,12 +269,17 @@ def train_all_models(dataset: str = 'mnist_csv', data_dir: str | None = None, ep
                 return x.tolist()
             return x
 
+        label_mapping_json = {str(k): v for k, v in sorted(label_mapping.items())}
+
         metadata = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "dataset": dataset,
             "data_dir": os.path.abspath(use_dir) if use_dir else None,
+            "include_lowercase": bool(include_lowercase),
             "epochs": int(epochs),
             "subset_size": int(subset_size),
+            "class_names": class_names,
+            "label_mapping": label_mapping_json,
             "train_shapes": {
                 "X_train": list(X_train.shape),
                 "X_test": list(X_test.shape),
@@ -273,6 +310,17 @@ def train_all_models(dataset: str = 'mnist_csv', data_dir: str | None = None, ep
             pass
         print(f"\nSaved training metadata to: {meta}")
         print(f"Saved dataset-specific metadata to: {meta_ds}")
+        labels_generic = os.path.join(models_dir, "label_mapping.json")
+        labels_dataset = os.path.join(models_dir, f"label_mapping_{dataset}.json")
+        with open(labels_generic, "w", encoding="utf-8") as f:
+            json.dump(label_mapping_json, f, ensure_ascii=False, indent=2)
+        try:
+            with open(labels_dataset, "w", encoding="utf-8") as f:
+                json.dump(label_mapping_json, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        print(f"Saved label mapping to: {labels_generic}")
+        print(f"Saved dataset-specific label mapping to: {labels_dataset}")
     except Exception as e:
         print(f"\nWarning: failed to write training metadata: {e}")
 
@@ -314,13 +362,19 @@ def quick_test():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train HNRS models")
     parser.add_argument("--quick-test", action="store_true", help="Run a quick dummy-data test")
-    parser.add_argument("--dataset", choices=["mnist_csv", "image_folder", "emnist_digits", "svhn", "combined"], default="mnist_csv",
+    parser.add_argument("--dataset", choices=["mnist_csv", "image_folder", "emnist_digits", "svhn", "nist_by_class", "combined"], default="mnist_csv",
                         help="Dataset source")
     parser.add_argument("--data-dir", type=str, default=None,
                         help="Data directory (required for image_folder)")
     parser.add_argument("--epochs", type=int, default=10, help="CNN training epochs")
+    parser.add_argument("--include-lowercase", dest="include_lowercase", action="store_true", default=True,
+                        help="Include lowercase letters when using nist_by_class dataset.")
+    parser.add_argument("--no-include-lowercase", dest="include_lowercase", action="store_false",
+                        help="Exclude lowercase letters when using nist_by_class dataset.")
     parser.add_argument("--subset-size", type=int, default=10000,
                         help="Samples for SVM/RF speed-up")
+    parser.add_argument("--max-per-class", type=int, default=None,
+                        help="For nist_by_class, cap loaded samples per character (default 10000)")
 
     args = parser.parse_args()
 
@@ -331,14 +385,20 @@ if __name__ == "__main__":
             comparison = train_all_models(dataset=args.dataset,
                                           data_dir=args.data_dir,
                                           epochs=args.epochs,
-                                          subset_size=args.subset_size)
+                                          subset_size=args.subset_size,
+                                          include_lowercase=args.include_lowercase,
+                                          max_per_class=args.max_per_class)
         except FileNotFoundError as e:
             _, _, default_csv_dir = _project_paths()
             print(f"\nError: {e}")
             if args.dataset == 'mnist_csv':
                 print(f"Expected MNIST CSV files in: {default_csv_dir}")
-            else:
+            elif args.dataset == 'image_folder':
                 print("For image_folder, ensure structure: <root>/train/0..9[/images], optional <root>/test/0..9")
+            elif args.dataset == 'nist_by_class':
+                print("For nist_by_class, point --data-dir to the folder containing hex-ASCII subfolders (e.g. data/by_class/by_class).")
+            else:
+                print("Verify the dataset path and structure for the selected loader.")
             print("Run with '--quick-test' flag to test with dummy data")
         except Exception as e:
             print(f"\nUnexpected error: {e}")

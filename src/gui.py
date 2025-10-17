@@ -1,27 +1,29 @@
 """
-GUI Application for Handwritten Number Recognition System
-Provides user interface for drawing, uploading, and recognizing handwritten numbers
+GUI Application for Handwritten Character Recognition System
+Provides user interface for drawing, uploading, and recognizing handwritten characters
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import cv2
 import numpy as np
+import json
 from PIL import Image, ImageTk, ImageDraw
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import os
 import sys
+from typing import Any, Dict
 
 # Add src directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from models import CNNModel, SVMModel, RandomForestModel
-from image_preprocessing import ImagePreprocessor, preprocess_for_mnist_model
+from image_preprocessing import ImagePreprocessor, preprocess_for_mnist_model, prepare_for_character_model
 from image_segmentation import ImageSegmenter, MultiDigitProcessor
 
 class DrawingCanvas:
-    """Canvas for drawing handwritten digits"""
+    """Canvas for drawing handwritten characters"""
     
     def __init__(self, parent, width=280, height=280):
         self.parent = parent
@@ -82,11 +84,11 @@ class DrawingCanvas:
         return gray_array
 
 class HNRSApplication:
-    """Main GUI Application for Handwritten Number Recognition System"""
+    """Main GUI Application for Handwritten Character Recognition System"""
     
     def __init__(self, root):
         self.root = root
-        self.root.title("Handwritten Number Recognition System (HNRS)")
+        self.root.title("Handwritten Character Recognition System (HNRS)")
         self.root.geometry("1200x800")
         
         # Initialize components
@@ -95,27 +97,49 @@ class HNRSApplication:
         self.multi_digit_processor = MultiDigitProcessor()
         self.models = {}
         self.last_auto_seg_method: str | None = None
-        
+
+        self.recognition_modes: Dict[str, Dict[str, Any]] = {
+            "digits": {
+                "label": "Digits (0-9)",
+                "dataset": "mnist_csv",
+                "allowed_type": "digits",
+            },
+            "letters": {
+                "label": "Letters (A-Z, a-z)",
+                "dataset": "nist_by_class",
+                "allowed_type": "letters",
+            },
+        }
+        self.model_cache: Dict[str, Dict[str, Any]] = {}
+        self.active_mode: str = "digits"
+        self.active_dataset: str = self.recognition_modes[self.active_mode]["dataset"]
+        self.active_label_mapping: Dict[int, str] = {}
+
         # Current image
         self.current_image = None
         self.processed_image = None
-        
+
         # Load models
-        self.load_models()
+        self.load_models(self.active_mode)
         
         # Create GUI
         self.create_widgets()
         
-    def load_models(self):
-        """Load all trained models"""
+    def load_models(self, mode: str | None = None, force_reload: bool = False):
+        """Load trained models for the requested recognition mode."""
+        mode_key = mode or self.active_mode
+        if mode_key not in self.recognition_modes:
+            raise ValueError(f"Unknown recognition mode: {mode_key}")
+        config = self.recognition_modes[mode_key]
+        dataset = config["dataset"]
+
         try:
-            # Determine possible model directories
             src_dir = os.path.dirname(os.path.abspath(__file__))
             project_root = os.path.dirname(src_dir)
-            primary_models_dir = os.path.join(project_root, 'models')
-            fallback_models_dir = os.path.join(src_dir, 'models')
+            primary_models_dir = os.path.join(project_root, "models")
+            fallback_models_dir = os.path.join(src_dir, "models")
 
-            def find_model_path(filename):
+            def find_model_path(filename: str) -> str | None:
                 primary_path = os.path.join(primary_models_dir, filename)
                 fallback_path = os.path.join(fallback_models_dir, filename)
                 if os.path.exists(primary_path):
@@ -124,56 +148,180 @@ class HNRSApplication:
                     return fallback_path
                 return None
 
-            # Prefer models trained on the combined dataset if present
-            def find_prefer_combined(basename: str) -> str | None:
-                pref = [
-                    basename.replace('.', '_combined.'),  # e.g., cnn_model_combined.h5
-                    basename,                              # generic fallback
-                ]
-                for name in pref:
-                    p = find_model_path(name)
-                    if p:
-                        return p
-                return None
+            if not force_reload and mode_key in self.model_cache:
+                cached = self.model_cache[mode_key]
+                self.models = dict(cached["models"])
+                label_mapping = dict(cached["label_mapping"])
+                self.active_mode = mode_key
+                self.active_dataset = dataset
+                self.active_label_mapping = label_mapping
+                allowed_chars = self._allowed_characters_for_mode(mode_key, label_mapping)
+                self._configure_multi_digit_models(label_mapping, allowed_chars, config.get("allowed_type"))
+                self._refresh_model_selector()
+                return
 
-            # Load CNN model
-            cnn_model = CNNModel()
-            cnn_path = find_prefer_combined('cnn_model.h5')
-            if cnn_path:
-                cnn_model.load_model(cnn_path)
-                self.models['CNN'] = cnn_model
-                print("CNN model loaded successfully")
-            
-            # Load SVM model
-            svm_model = SVMModel()
-            svm_path = find_prefer_combined('svm_model.pkl')
-            if svm_path:
-                svm_model.load_model(svm_path)
-                self.models['SVM'] = svm_model
-                print("SVM model loaded successfully")
-            
-            # Load Random Forest model
-            rf_model = RandomForestModel()
-            rf_path = find_prefer_combined('rf_model.pkl')
-            if rf_path:
-                rf_model.load_model(rf_path)
-                self.models['Random Forest'] = rf_model
-                print("Random Forest model loaded successfully")
-                
-            # Set up multi-digit processor
-            # Only include models that actually loaded (non-None)
-            available_models = {
-                'cnn': self.models.get('CNN'),
-                'svm': self.models.get('SVM'),
-                'rf': self.models.get('Random Forest')
+            def candidate_names(basename: str) -> list[str]:
+                candidates: list[str] = []
+                if dataset:
+                    candidates.append(basename.replace('.', f'_{dataset}.'))
+                if dataset == "nist_by_class":
+                    candidates.append(basename.replace('.', "_combined."))
+                candidates.append(basename)
+                seen: set[str] = set()
+                ordered: list[str] = []
+                for name in candidates:
+                    if name not in seen:
+                        ordered.append(name)
+                        seen.add(name)
+                return ordered
+
+            loaded_models: Dict[str, Any] = {}
+            model_specs = [
+                ("CNN", CNNModel, "cnn_model.h5"),
+                ("SVM", SVMModel, "svm_model.pkl"),
+                ("Random Forest", RandomForestModel, "rf_model.pkl"),
+            ]
+
+            for display_name, cls, basename in model_specs:
+                model_path = None
+                for candidate in candidate_names(basename):
+                    model_path = find_model_path(candidate)
+                    if model_path:
+                        break
+                if not model_path:
+                    print(f"Warning: {display_name} weights not found for dataset {dataset!r}")
+                    continue
+                try:
+                    model = cls()
+                    model.load_model(model_path)
+                except Exception as exc:
+                    print(f"Warning: failed to load {display_name} model from {model_path}: {exc}")
+                    continue
+                loaded_models[display_name] = model
+                print(f"Loaded {display_name} model from {model_path}")
+
+            self.models = loaded_models
+            label_mapping = self._load_label_mapping_for_dataset(
+                dataset, [primary_models_dir, fallback_models_dir]
+            )
+            self.active_mode = mode_key
+            self.active_dataset = dataset
+            self.active_label_mapping = label_mapping
+            self.model_cache[mode_key] = {
+                "models": dict(loaded_models),
+                "label_mapping": dict(label_mapping),
             }
-            # Filter out None entries to prevent NoneType.predict errors
-            self.multi_digit_processor.models = {k: v for k, v in available_models.items() if v is not None}
+
+            allowed_chars = self._allowed_characters_for_mode(mode_key, label_mapping)
+            self._configure_multi_digit_models(label_mapping, allowed_chars, config.get("allowed_type"))
+
+            self._refresh_model_selector()
+            if hasattr(self, "status_var"):
+                mode_label = config.get("label", dataset)
+                self.update_status(f"Loaded {mode_label} models")
 
         except Exception as e:
             messagebox.showerror("Model Loading Error", f"Error loading models: {e}")
             print(f"Error loading models: {e}")
-    
+    def _load_label_mapping_for_dataset(self, dataset: str, search_dirs: list[str]) -> Dict[int, str]:
+        """Load a label mapping for the requested dataset with graceful fallbacks."""
+        candidates: list[str] = []
+        for base_dir in search_dirs:
+            if not base_dir:
+                continue
+            dataset_file = os.path.join(base_dir, f"label_mapping_{dataset}.json")
+            if dataset_file not in candidates:
+                candidates.append(dataset_file)
+        for base_dir in search_dirs:
+            if not base_dir:
+                continue
+            generic_file = os.path.join(base_dir, "label_mapping.json")
+            if generic_file not in candidates:
+                candidates.append(generic_file)
+        for path_candidate in candidates:
+            if path_candidate and os.path.exists(path_candidate):
+                try:
+                    with open(path_candidate, "r", encoding="utf-8") as handle:
+                        data = json.load(handle)
+                    mapping = {int(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+                    if mapping:
+                        print(f"Loaded label mapping from {path_candidate}")
+                        return mapping
+                except Exception as exc:
+                    print(f"Warning: failed to load label mapping {path_candidate}: {exc}")
+        if dataset == "mnist_csv":
+            return {i: str(i) for i in range(10)}
+        fallback_chars = self._alphanumeric_fallback_chars()
+        return {idx: char for idx, char in enumerate(fallback_chars)}
+
+    def _alphanumeric_fallback_chars(self) -> list[str]:
+        digits = [str(i) for i in range(10)]
+        uppercase = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
+        lowercase = [chr(c) for c in range(ord("a"), ord("z") + 1)]
+        return digits + uppercase + lowercase
+
+    def _allowed_characters_for_mode(self, mode_key: str, label_mapping: Dict[int, str]) -> set[str] | None:
+        config = self.recognition_modes.get(mode_key, {})
+        allowed_type = config.get("allowed_type")
+        base_chars: list[str]
+        if allowed_type == "digits":
+            base_chars = [str(i) for i in range(10)]
+        elif allowed_type == "letters":
+            uppercase = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
+            lowercase = [chr(c) for c in range(ord("a"), ord("z") + 1)]
+            base_chars = uppercase + lowercase
+        else:
+            return None
+        mapping_values = set(label_mapping.values())
+        filtered = {char for char in base_chars if char in mapping_values}
+        return filtered or None
+
+    def _configure_multi_digit_models(self, label_mapping: Dict[int, str], allowed_chars: set[str] | None = None, profile: str | None = None) -> None:
+        if label_mapping:
+            self.multi_digit_processor.index_to_char = dict(label_mapping)
+        else:
+            self.multi_digit_processor.index_to_char = {}
+        if not self.multi_digit_processor.index_to_char:
+            if self.active_dataset == "mnist_csv":
+                self.multi_digit_processor.index_to_char = {i: str(i) for i in range(10)}
+            else:
+                fallback_chars = self._alphanumeric_fallback_chars()
+                self.multi_digit_processor.index_to_char = {idx: char for idx, char in enumerate(fallback_chars)}
+        profile_key = profile or self.recognition_modes.get(self.active_mode, {}).get("allowed_type", "digits")
+        self.multi_digit_processor.set_processing_profile(profile_key)
+        self.multi_digit_processor.set_allowed_characters(allowed_chars)
+        available_models = {
+            "cnn": self.models.get("CNN"),
+            "svm": self.models.get("SVM"),
+            "rf": self.models.get("Random Forest"),
+        }
+        base_models = {name: model for name, model in available_models.items() if model is not None}
+        self.multi_digit_processor.models = dict(base_models)
+        if len(base_models) >= 2:
+            self.multi_digit_processor.models["ensemble"] = dict(base_models)
+        else:
+            self.multi_digit_processor.models.pop("ensemble", None)
+    def _refresh_model_selector(self) -> None:
+        if not hasattr(self, "model_var") or not hasattr(self, "model_combo"):
+            return
+        model_names = list(self.models.keys())
+        self.model_combo["values"] = model_names
+        if model_names:
+            if self.model_var.get() not in model_names:
+                self.model_var.set(model_names[0])
+        else:
+            self.model_var.set("")
+
+    def on_recognition_mode_change(self) -> None:
+        selected_mode = self.recognition_var.get()
+        if selected_mode == self.active_mode:
+            return
+        previous_mode = self.active_mode
+        self.load_models(selected_mode)
+        if self.active_mode != selected_mode:
+            self.recognition_var.set(previous_mode)
+
+
     def create_widgets(self):
         """Create and arrange GUI widgets"""
         # Main frame
@@ -187,7 +335,7 @@ class HNRSApplication:
         main_frame.rowconfigure(1, weight=1)
         
         # Title
-        title_label = ttk.Label(main_frame, text="Handwritten Number Recognition System", 
+        title_label = ttk.Label(main_frame, text="Handwritten Character Recognition System", 
                                font=('Arial', 16, 'bold'))
         title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
         
@@ -196,7 +344,7 @@ class HNRSApplication:
         input_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
         
         # Drawing canvas
-        canvas_label = ttk.Label(input_frame, text="Draw a number:")
+        canvas_label = ttk.Label(input_frame, text="Draw characters:")
         canvas_label.pack(pady=(0, 5))
         
         self.drawing_canvas = DrawingCanvas(input_frame)
@@ -223,24 +371,45 @@ class HNRSApplication:
         control_frame = ttk.LabelFrame(main_frame, text="Settings & Controls", padding="10")
         control_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
         
+        # Recognition target selection
+        target_label = ttk.Label(control_frame, text="Recognition Target:")
+        target_label.pack(pady=(0, 5))
+
+        self.recognition_var = tk.StringVar(value=self.active_mode)
+        for mode_key in ("digits", "letters"):
+            if mode_key not in self.recognition_modes:
+                continue
+            mode_info = self.recognition_modes[mode_key]
+            ttk.Radiobutton(
+                control_frame,
+                text=mode_info["label"],
+                value=mode_key,
+                variable=self.recognition_var,
+                command=self.on_recognition_mode_change,
+            ).pack(anchor=tk.W, pady=2)
+
+        ttk.Separator(control_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+
         # Model selection
         model_label = ttk.Label(control_frame, text="Select Model:")
         model_label.pack(pady=(0, 5))
-        
-        # Populate model dropdown with actually loaded models
+
         loaded_model_names = list(self.models.keys())
-        # Default to first loaded model if available; otherwise keep placeholder
-        default_model = loaded_model_names[0] if loaded_model_names else "CNN"
+        default_model = loaded_model_names[0] if loaded_model_names else ""
         self.model_var = tk.StringVar(value=default_model)
-        model_combo = ttk.Combobox(control_frame, textvariable=self.model_var,
-                                  values=loaded_model_names, state="readonly")
-        model_combo.pack(pady=(0, 10))
-        
+        self.model_combo = ttk.Combobox(
+            control_frame,
+            textvariable=self.model_var,
+            values=loaded_model_names,
+            state="readonly"
+        )
+        self.model_combo.pack(pady=(0, 10))
+
         # Segmentation method
         seg_label = ttk.Label(control_frame, text="Segmentation Method:")
         seg_label.pack(pady=(0, 5))
         
-        self.segmentation_var = tk.StringVar(value="contours")
+        self.segmentation_var = tk.StringVar(value="Auto selection")
         seg_combo = ttk.Combobox(control_frame, textvariable=self.segmentation_var,
                                 values=["Auto selection", "contours", "connected_components", "projection"], state="readonly")
         seg_combo.pack(pady=(0, 10))
@@ -326,7 +495,7 @@ class HNRSApplication:
                 messagebox.showerror("Error", f"Could not load image: {e}")
                 
     def recognize_drawing(self):
-        """Recognize number drawn on canvas"""
+        """Recognize text drawn on canvas"""
         try:
             # Get image from canvas
             canvas_image = self.drawing_canvas.get_image_array()
@@ -404,24 +573,26 @@ class HNRSApplication:
         self.results_text.delete(1.0, tk.END)
         
         # Main result
-        self.results_text.insert(tk.END, f"RECOGNIZED NUMBER: {number_string}\n")
+        self.results_text.insert(tk.END, f"RECOGNIZED TEXT: {number_string}\n")
         self.results_text.insert(tk.END, "="*40 + "\n\n")
         
         # Individual digit results
-        self.results_text.insert(tk.END, "Individual Digit Predictions:\n")
+        self.results_text.insert(tk.END, "Individual Character Predictions:\n")
         self.results_text.insert(tk.END, "-"*30 + "\n")
         
         for i, (digit, confidence) in enumerate(predictions):
-            self.results_text.insert(tk.END, f"Digit {i+1}: {digit} (Confidence: {confidence:.3f})\n")
+            self.results_text.insert(tk.END, f"Character {i+1}: {digit} (Confidence: {confidence:.3f})\n")
         
         self.results_text.insert(tk.END, "\n")
         
         # Model information
         model_name = self.model_var.get()
         self.results_text.insert(tk.END, f"Model Used: {model_name}\n")
+        mode_label = self.recognition_modes.get(self.active_mode, {}).get("label", self.active_mode)
+        self.results_text.insert(tk.END, f"Recognition Target: {mode_label}\n")
         seg_disp = segmentation_used if segmentation_used else self.segmentation_var.get()
         self.results_text.insert(tk.END, f"Segmentation: {seg_disp}\n")
-        self.results_text.insert(tk.END, f"Number of Digits: {len(predictions)}\n")
+        self.results_text.insert(tk.END, f"Character Count: {len(predictions)}\n")
         
         # Average confidence
         if predictions:
@@ -440,6 +611,8 @@ class HNRSApplication:
             self.results_text.delete(1.0, tk.END)
             self.results_text.insert(tk.END, "MODEL COMPARISON RESULTS\n")
             self.results_text.insert(tk.END, "="*50 + "\n\n")
+            mode_label = self.recognition_modes.get(self.active_mode, {}).get("label", self.active_mode)
+            self.results_text.insert(tk.END, f"Recognition Target: {mode_label}\n\n")
             
             selection_raw = self.segmentation_var.get()
             segmentation_method = selection_raw.lower().replace(' ', '_')
@@ -505,7 +678,7 @@ class HNRSApplication:
                         self.current_image, model_name, m
                     )
                     avg_conf = np.mean([c for _, c in predictions]) if predictions else 0
-                    self.results_text.insert(tk.END, f"{m}: {number_string}  | digits: {[p[0] for p in predictions]}  | avg: {avg_conf:.3f}\n")
+                    self.results_text.insert(tk.END, f"{m}: {number_string}  | characters: {[p[0] for p in predictions]}  | avg: {avg_conf:.3f}\n")
                 except Exception as e:
                     self.results_text.insert(tk.END, f"{m}: Error - {e}\n")
 
@@ -625,7 +798,7 @@ class HNRSApplication:
                 self.current_image, method, return_fig=True
             )
             if fig is None:
-                ttk.Label(seg_window, text="No digits found to visualize").pack(padx=20, pady=20)
+                ttk.Label(seg_window, text="No characters found to visualize").pack(padx=20, pady=20)
                 return
 
             canvas = FigureCanvasTkAgg(fig, master=seg_window)
@@ -680,3 +853,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

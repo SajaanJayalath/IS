@@ -24,7 +24,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 import pickle
 import os
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List, Optional
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -33,13 +33,15 @@ class CNNModel:
     
     def __init__(self, input_shape=(28, 28, 1), num_classes=10,
                  use_augmentation: bool = True,
-                 label_smoothing: float = 0.0):
+                 label_smoothing: float = 0.0,
+                 class_names: Optional[List[str]] = None):
         self.input_shape = input_shape
-        self.num_classes = num_classes
+        self.num_classes = int(num_classes)
         self.model = None
         self.history = None
         self.use_augmentation = use_augmentation
         self.label_smoothing = float(label_smoothing)
+        self.class_names = class_names if class_names is not None else [str(i) for i in range(self.num_classes)]
         
     def _ensure_tf(self):
         """Ensure TensorFlow is available before using CNN features."""
@@ -189,13 +191,23 @@ class CNNModel:
         self._ensure_tf()
         if self.model is None:
             raise ValueError("Model not trained or loaded yet!")
-        
-        # Ensure input has correct shape
-        if len(X.shape) == 3:
-            X = X.reshape(X.shape[0], X.shape[1], X.shape[2], 1)
-        elif len(X.shape) == 2:
+
+        X = np.asarray(X)
+        if X.ndim == 2:
             X = X.reshape(1, X.shape[0], X.shape[1], 1)
-        
+        elif X.ndim == 3:
+            if X.shape[-1] == 1:
+                X = X.reshape(1, X.shape[0], X.shape[1], 1)
+            else:
+                X = X.reshape(1, X.shape[0], X.shape[1], X.shape[2])
+        elif X.ndim == 4:
+            if X.shape[0] != 1:
+                # keep as is for batch predictions
+                pass
+        else:
+            raise ValueError(f"Unexpected input shape for CNN predict: {X.shape}")
+
+        X = X.astype(np.float32)
         predictions = self.model.predict(X)
         return np.argmax(predictions, axis=1), predictions
     
@@ -299,13 +311,13 @@ class SVMModel:
         """Make predictions on input data"""
         if self.model is None:
             raise ValueError("Model not trained or loaded yet!")
-        
-        # Flatten images for SVM
-        if len(X.shape) > 2:
+
+        X = np.array(X)
+        if X.ndim == 4:
             X_flat = X.reshape(X.shape[0], -1)
         else:
             X_flat = X.reshape(1, -1)
-        
+
         predictions = self.model.predict(X_flat)
         probabilities = self.model.predict_proba(X_flat)
         return predictions, probabilities
@@ -379,13 +391,13 @@ class RandomForestModel:
         """Make predictions on input data"""
         if self.model is None:
             raise ValueError("Model not trained or loaded yet!")
-        
-        # Flatten images for Random Forest
-        if len(X.shape) > 2:
+
+        X = np.array(X)
+        if X.ndim == 4:
             X_flat = X.reshape(X.shape[0], -1)
         else:
             X_flat = X.reshape(1, -1)
-        
+
         predictions = self.model.predict(X_flat)
         probabilities = self.model.predict_proba(X_flat)
         return predictions, probabilities

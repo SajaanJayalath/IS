@@ -283,44 +283,91 @@ class ImagePreprocessor:
         plt.tight_layout()
         plt.show()
 
-def preprocess_for_mnist_model(image: np.ndarray) -> np.ndarray:
-    """
-    Preprocess image to match MNIST format for model prediction
-    
-    Args:
-        image: Input image (can be any size, grayscale or color)
-    
-    Returns:
-        Preprocessed image ready for MNIST model (28x28, normalized)
-    """
-    preprocessor = ImagePreprocessor()
-    
-    # Standard preprocessing pipeline for MNIST compatibility
-    steps = ['grayscale', 'clahe', 'median', 'threshold', 'morphology_close',
-             'deskew', 'invert', 'resize', 'center_mass', 'normalize']
-    
-    processed = preprocessor.preprocess_pipeline(image, steps)
-    
-    # Ensure correct shape for CNN model (28, 28, 1)
-    if len(processed.shape) == 2:
-        processed = processed.reshape(28, 28, 1)
-    
-    return processed
 
-if __name__ == "__main__":
-    # Test preprocessing with sample image
-    preprocessor = ImagePreprocessor()
-    
-    # Create a test image (simulated handwritten digit)
-    test_image = np.zeros((100, 100), dtype=np.uint8)
-    cv2.circle(test_image, (50, 50), 30, 255, -1)  # White circle
-    cv2.circle(test_image, (50, 50), 15, 0, -1)    # Black hole (making it look like 0)
-    
-    print("Testing image preprocessing pipeline...")
-    processed = preprocessor.preprocess_pipeline(test_image)
-    print(f"Original shape: {test_image.shape}")
-    print(f"Processed shape: {processed.shape}")
-    print(f"Processed range: {processed.min():.3f} - {processed.max():.3f}")
-    
-    # Visualize results
-    preprocessor.visualize_preprocessing_steps(test_image)
+def preprocess_for_mnist_model(image: np.ndarray) -> np.ndarray:
+    """Preprocess a user-drawn digit so it matches MNIST training data."""
+    if image is None:
+        raise ValueError('Input image is None')
+
+    gray = np.asarray(image)
+    if gray.ndim == 3 and gray.shape[2] == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+
+    if gray.dtype != np.uint8:
+        gray = gray.astype(np.float32)
+        if gray.max() <= 1.0:
+            gray *= 255.0
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+
+    # Binarise and invert so foreground strokes are white like MNIST digits
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    kernel = np.ones((3, 3), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    coords = cv2.findNonZero(thresh)
+    if coords is None:
+        digit_crop = thresh
+    else:
+        x, y, w, h = cv2.boundingRect(coords)
+        digit_crop = thresh[y:y + h, x:x + w]
+        if w == 0 or h == 0:
+            digit_crop = thresh
+
+    target_size = 28
+    pad_margin = 4
+    max_dim = max(digit_crop.shape[:2])
+    if max_dim == 0:
+        resized = np.zeros((target_size, target_size), dtype=np.uint8)
+    else:
+        scale = (target_size - pad_margin) / float(max_dim)
+        new_w = max(1, int(round(digit_crop.shape[1] * scale)))
+        new_h = max(1, int(round(digit_crop.shape[0] * scale)))
+        resized = cv2.resize(digit_crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((target_size, target_size), dtype=np.uint8)
+    y0 = (target_size - resized.shape[0]) // 2
+    x0 = (target_size - resized.shape[1]) // 2
+    canvas[y0:y0 + resized.shape[0], x0:x0 + resized.shape[1]] = resized
+
+    canvas = canvas.astype(np.float32) / 255.0
+    return canvas.reshape(target_size, target_size, 1)
+def prepare_for_character_model(image: np.ndarray, target_size: int = 28) -> np.ndarray:
+    """
+    Prepare an image drawn by the user for the character models trained on the NIST by_class dataset.
+
+    This mirrors the preprocessing performed during training: convert to grayscale, optionally invert so
+    foreground is bright, resize with aspect-ratio preservation, and normalise to [0, 1].
+    """
+    if image is None:
+        raise ValueError('Input image is None')
+
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+
+    if gray.dtype != np.uint8:
+        gray = np.clip(gray, 0, 255).astype(np.uint8)
+
+    h, w = gray.shape[:2]
+    if h == 0 or w == 0:
+        raise ValueError('Input image has invalid dimensions')
+
+    border = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
+    center = gray[h // 4: 3 * h // 4, w // 4: 3 * w // 4]
+    if center.size > 0 and border.mean() < center.mean():
+        gray = 255 - gray
+
+    scale = min(target_size / w, target_size / h)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    canvas = np.zeros((target_size, target_size), dtype=np.uint8)
+    y0 = (target_size - new_h) // 2
+    x0 = (target_size - new_w) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+
+    canvas = canvas.astype(np.float32) / 255.0
+    return canvas.reshape(target_size, target_size, 1)
