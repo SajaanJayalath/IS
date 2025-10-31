@@ -376,6 +376,9 @@ class NISTByClassLoader:
         max_per_class: Optional[int] = 10000,
         test_size: float = 0.2,
         random_state: int = 42,
+        apply_centering: bool = True,
+        apply_deskew: bool = True,
+        apply_clahe: bool = False,
     ):
         self.root_dir = root_dir
         self.image_size = image_size
@@ -385,6 +388,9 @@ class NISTByClassLoader:
         self.max_per_class = max_per_class
         self.test_size = test_size
         self.random_state = random_state
+        self.apply_centering = apply_centering
+        self.apply_deskew = apply_deskew
+        self.apply_clahe = apply_clahe
         self.X_train: Optional[np.ndarray] = None
         self.y_train: Optional[np.ndarray] = None
         self.X_test: Optional[np.ndarray] = None
@@ -419,10 +425,19 @@ class NISTByClassLoader:
         img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise ValueError(f"Failed to read image: {path}")
+
+        # Normalize polarity (foreground bright)
         h, w = img.shape[:2]
         border = np.concatenate([img[0, :], img[-1, :], img[:, 0], img[:, -1]])
         if border.mean() < img[h // 4: 3 * h // 4, w // 4: 3 * w // 4].mean():
             img = 255 - img
+
+        # Optional CLAHE contrast improvement
+        if self.apply_clahe:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            img = clahe.apply(img)
+
+        # Aspect-ratio preserving resize into square canvas
         target = self.image_size
         scale = min(target / w, target / h)
         new_w = max(1, int(round(w * scale)))
@@ -432,6 +447,41 @@ class NISTByClassLoader:
         y0 = (target - new_h) // 2
         x0 = (target - new_w) // 2
         canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+
+        # Optional centering by center of mass (computed on binary mask)
+        if self.apply_centering:
+            # Otsu to binary with white strokes
+            _, bw = cv2.threshold(canvas, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            if bw.mean() > 127:
+                bw = 255 - bw
+            M = cv2.moments(bw)
+            if abs(M.get("m00", 0)) > 1e-3:
+                cx = M["m10"] / M["m00"]
+                cy = M["m01"] / M["m00"]
+                shift_x = int(round((target // 2) - cx))
+                shift_y = int(round((target // 2) - cy))
+                M_shift = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
+                canvas = cv2.warpAffine(canvas, M_shift, (target, target), flags=cv2.INTER_NEAREST, borderValue=0)
+
+        # Optional deskew using min-area rectangle angle (computed on binary mask)
+        if self.apply_deskew:
+            _, bw2 = cv2.threshold(canvas, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            if bw2.mean() > 127:
+                bw2 = 255 - bw2
+            cnts, _ = cv2.findContours(bw2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cnts:
+                largest = max(cnts, key=cv2.contourArea)
+                rect = cv2.minAreaRect(largest)
+                angle = rect[2]
+                if angle < -45:
+                    angle = -(90 + angle)
+                else:
+                    angle = -angle
+                if abs(angle) > 0.5:
+                    center = (target // 2, target // 2)
+                    M_rot = cv2.getRotationMatrix2D(center, angle, 1.0)
+                    canvas = cv2.warpAffine(canvas, M_rot, (target, target), flags=cv2.INTER_CUBIC, borderValue=0)
+
         return canvas.reshape(-1)
 
     def _class_sort_key(self, char: str) -> tuple[int, int]:

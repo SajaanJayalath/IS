@@ -29,12 +29,16 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 class CNNModel:
-    """Convolutional Neural Network for digit recognition"""
+    """Convolutional Neural Network for digit/character recognition."""
     
     def __init__(self, input_shape=(28, 28, 1), num_classes=10,
                  use_augmentation: bool = True,
                  label_smoothing: float = 0.0,
-                 class_names: Optional[List[str]] = None):
+                 class_names: Optional[List[str]] = None,
+                 architecture: str = "default",
+                 augmentation_strength: str = "standard",
+                 base_filters: int = 32,
+                 learning_rate: float = 1e-3):
         self.input_shape = input_shape
         self.num_classes = int(num_classes)
         self.model = None
@@ -42,6 +46,14 @@ class CNNModel:
         self.use_augmentation = use_augmentation
         self.label_smoothing = float(label_smoothing)
         self.class_names = class_names if class_names is not None else [str(i) for i in range(self.num_classes)]
+        self.architecture = architecture.lower().strip()
+        self.augmentation_strength = augmentation_strength.lower().strip()
+        self.base_filters = int(base_filters)
+        self.learning_rate = float(learning_rate)
+        if self.architecture not in {"default", "letters"}:
+            raise ValueError(f"Unsupported CNN architecture '{architecture}'. Expected 'default' or 'letters'.")
+        if self.augmentation_strength not in {"standard", "strong"}:
+            raise ValueError(f"Unsupported augmentation preset '{augmentation_strength}'. Expected 'standard' or 'strong'.")
         
     def _ensure_tf(self):
         """Ensure TensorFlow is available before using CNN features."""
@@ -52,23 +64,34 @@ class CNNModel:
                 f"or switch to SVM/Random Forest. Original import error: {_TF_IMPORT_ERROR}"
             )
         
-    def build_model(self):
-        """Build CNN architecture optimized for MNIST digit recognition"""
-        self._ensure_tf()
-        aug_layers = []
-        if self.use_augmentation:
-            # Lightweight on-the-fly augmentation applied only during training
-            aug_layers = [
+    def _make_augmentation_layers(self) -> List[layers.Layer]:
+        """Return augmentation pipeline conditioned on the requested strength."""
+        if not self.use_augmentation:
+            return [layers.Input(shape=self.input_shape)]
+        if self.augmentation_strength == "strong":
+            return [
                 layers.Input(shape=self.input_shape),
-                layers.RandomRotation(0.08),
-                layers.RandomTranslation(0.05, 0.05),
-                layers.RandomZoom(0.10),
-                layers.RandomContrast(0.10),
+                layers.RandomRotation(0.18),
+                layers.RandomTranslation(0.12, 0.12),
+                layers.RandomZoom(0.20),
+                layers.RandomContrast(0.20),
             ]
+        return [
+            layers.Input(shape=self.input_shape),
+            layers.RandomRotation(0.08),
+            layers.RandomTranslation(0.05, 0.05),
+            layers.RandomZoom(0.10),
+            layers.RandomContrast(0.10),
+        ]
+
+    def _build_default_model(self) -> keras.Sequential:
+        """Baseline architecture tuned originally for MNIST digits."""
+        self._ensure_tf()
+        aug_layers = self._make_augmentation_layers()
 
         L2 = keras.regularizers.l2(1e-4)
 
-        self.model = keras.Sequential([
+        model = keras.Sequential([
             *(aug_layers or [layers.Input(shape=self.input_shape)]),
             # First Convolutional Block
             layers.Conv2D(32, (3, 3), activation='relu', kernel_regularizer=L2),
@@ -98,6 +121,56 @@ class CNNModel:
             layers.Dropout(0.5),
             layers.Dense(self.num_classes, activation='softmax')
         ])
+        return model
+
+    def _build_letters_model(self) -> keras.Sequential:
+        """Deeper architecture for letters with more filters and gentler dropout."""
+        self._ensure_tf()
+        aug_layers = self._make_augmentation_layers()
+        base = max(32, self.base_filters)
+        L2 = keras.regularizers.l2(5e-5)
+
+        model = keras.Sequential([
+            *(aug_layers or [layers.Input(shape=self.input_shape)]),
+            layers.Conv2D(base, (3, 3), padding='same', activation='relu', kernel_regularizer=L2),
+            layers.BatchNormalization(),
+            layers.Conv2D(base, (3, 3), padding='same', activation='relu', kernel_regularizer=L2),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.2),
+
+            layers.Conv2D(base * 2, (3, 3), padding='same', activation='relu', kernel_regularizer=L2),
+            layers.BatchNormalization(),
+            layers.Conv2D(base * 2, (3, 3), padding='same', activation='relu', kernel_regularizer=L2),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.25),
+
+            layers.Conv2D(base * 4, (3, 3), padding='same', activation='relu', kernel_regularizer=L2),
+            layers.BatchNormalization(),
+            layers.Conv2D(base * 4, (3, 3), padding='same', activation='relu', kernel_regularizer=L2),
+            layers.MaxPooling2D((2, 2)),
+            layers.Dropout(0.3),
+
+            layers.Conv2D(base * 4, (3, 3), padding='same', activation='relu', kernel_regularizer=L2),
+            layers.BatchNormalization(),
+            layers.Dropout(0.35),
+
+            layers.Flatten(),
+            layers.Dense(768, activation='relu', kernel_regularizer=L2),
+            layers.BatchNormalization(),
+            layers.Dropout(0.4),
+            layers.Dense(512, activation='relu', kernel_regularizer=L2),
+            layers.BatchNormalization(),
+            layers.Dropout(0.35),
+            layers.Dense(self.num_classes, activation='softmax')
+        ])
+        return model
+
+    def build_model(self):
+        """Build the requested CNN architecture."""
+        if self.architecture == "letters":
+            self.model = self._build_letters_model()
+        else:
+            self.model = self._build_default_model()
         
         # Compile model
         # Loss: prefer SparseCategoricalCrossentropy; add label_smoothing only if supported
@@ -117,15 +190,18 @@ class CNNModel:
                 print("Warning: label_smoothing not supported for SparseCategoricalCrossentropy in this Keras version; using standard loss.")
             loss_obj = 'sparse_categorical_crossentropy'
 
+        optimizer = keras.optimizers.Adam(learning_rate=self.learning_rate)
+
         self.model.compile(
-            optimizer='adam',
+            optimizer=optimizer,
             loss=loss_obj,
             metrics=['accuracy']
         )
         
         return self.model
     
-    def train(self, X_train, y_train, X_val=None, y_val=None, epochs=20, batch_size=128):
+    def train(self, X_train, y_train, X_val=None, y_val=None, epochs=20, batch_size=128,
+              class_weight=None, extra_callbacks: Optional[List[Any]] = None):
         """Train the CNN model"""
         self._ensure_tf()
         if self.model is None:
@@ -136,6 +212,8 @@ class CNNModel:
             keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
             keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=3)
         ]
+        if extra_callbacks:
+            callbacks.extend(extra_callbacks)
         
         # Train model
         validation_data = (X_val, y_val) if X_val is not None else None
@@ -146,7 +224,8 @@ class CNNModel:
             epochs=epochs,
             validation_data=validation_data,
             callbacks=callbacks,
-            verbose=1
+            verbose=1,
+            class_weight=class_weight
         )
         
         return self.history

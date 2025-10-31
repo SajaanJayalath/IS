@@ -2,195 +2,115 @@
 
 ## Overview
 
-This repository contains the Handwritten Character Recognition System (HNRS)
-developed by **Sajaan Jayalath** for the COS30018 Intelligent Systems unit.
-HNRS recognises hand‑written digits (0‑9) and letters (A‑Z, a‑z) by combining
-advanced image preprocessing with multiple machine learning models. The system
-packages everything needed to draw characters, upload images, run recognition,
-compare models, and retrain networks from raw datasets.
+HNRS is a Python application for recognizing handwritten digits, letters, and arithmetic expressions. It provides a Tkinter GUI to draw or upload images, plus a small CLI for testing. Under the hood it combines robust preprocessing, multiple segmentation strategies, and several classifier backends (CNN, SVM, Random Forest, k-NN). The project was developed for COS30018 Intelligent Systems.
 
-## Feature Highlights
+## Features
 
-- **Multi-target support** – switch instantly between digit and letter modes.
-- **Three model families** – Convolutional Neural Network (CNN), Support Vector
-  Machine (SVM), and Random Forest classifiers with ready-to-use weights.
-- **Robust preprocessing** – deskewing, contrast enhancement, morphology, and
-  adaptive thresholding tailored for noisy handwriting.
-- **Intelligent segmentation** – contour, projection, and connected-component
-  strategies with automatic method selection for multi-character inputs.
-- **Tkinter GUI** – draw characters, visualise preprocessing/segmentation, and
-  inspect per-character confidences in real time.
-- **Training pipelines** – scripts for MNIST digit models and NIST by_class
-  letter models, including metadata and label-mapping export.
+- Multi-mode recognition: digits, letters, arithmetic expressions
+- Segmentation methods: contours, connected components, projection, watershed (letters)
+- Models: CNN (TensorFlow), SVM, Random Forest, k-NN (letters), and an arithmetic CNN/ensemble
+- Tkinter GUI: draw/erase, upload, visualize preprocessing/segmentation, per-character confidences
+- Optional external MER integration for arithmetic recognition
 
-## Repository Layout
+## Repository Structure
 
-```
-.
-├── MNIST_CSV/                  # Datasets (tracked with Git LFS)
-├── models/                     # Saved model weights + metadata
-├── sample_images/              # Example handwritten character images
-├── src/
-│   ├── data_loader.py          # Data loading helpers (MNIST, EMNIST, NIST)
-│   ├── generate_synthetic_digits.py
-│   ├── gui.py                  # Tkinter front-end
-│   ├── image_preprocessing.py  # Preprocessing + augmentation utilities
-│   ├── image_segmentation.py   # Segmentation + multi-character logic
-│   ├── main.py                 # CLI / GUI entry point
-│   ├── models.py               # CNN, SVM, Random Forest implementations
-│   ├── train_models.py         # Digit (MNIST-style) training pipeline
-│   └── train_letters.py        # Letter (NIST by_class) training pipeline
-├── tests/                      # Optional automated checks
-├── requirements.txt            # Python dependencies
-└── README.md                   # Project documentation
-```
+- `src/main.py`: CLI/GUI entry point
+- `src/gui.py`: Tkinter interface, mode switching, visualization
+- `src/models.py`: CNN, SVM, Random Forest implementations for digits/characters
+- `src/image_preprocessing.py`: preprocessing and normalization utilities
+- `src/image_segmentation.py`: segmentation + multi-character processing (digits)
+- `src/arithmetic/`: arithmetic expression pipeline (segmentation, CNN/ensemble, heuristics)
+- `src/letters_new/`: letters pipeline (watershed segmentation; k-NN and optional CNN)
+- `src/integrations/mer_adapter.py`: adapter for external Math-Expression-Recognizer-and-Solver
+- `src/data_loader.py`: dataset loaders (MNIST CSV, NIST by_class, EMNIST, SVHN, combined)
+- `models/`: pretrained weights and label mappings
+  - `cnn_model.h5`, `cnn_model_mnist_csv.h5`, `cnn_model_nist_by_class.h5`
+  - `svm_model.pkl`, `rf_model.pkl` (+ `*_mnist_csv.pkl` variants)
+  - `cnn_model_arithmetic.h5`, `arithmetic_confusion_matrix.npy`
+  - `label_mapping.json`, `label_mapping_mnist_csv.json`, `label_mapping_nist_by_class.json`, `label_mapping_arithmetic.json`
+- `models_new/`: additional models (e.g., `letters_byclass_knn.pkl`)
+- `data/by_class/by_class/`: NIST SD19 by_class dataset (if available)
+- `Maths/`: legacy sandbox for arithmetic experiments (not used by the GUI)
 
-## Getting Started
+## Requirements
 
-### 1. Install prerequisites
+- Python 3.10 or 3.11 recommended
+- Install dependencies:
+  - `pip install -r requirements.txt`
+  - TensorFlow is required for CNN features; SVM/RandomForest/k-NN work without it
+  - Torch/torchvision are listed for optional dataset loaders; core GUI does not require them
 
-- Python 3.10 or later is recommended (Python 3.8+ supported).
-- Ensure [Git](https://git-scm.com/) and [Git LFS](https://git-lfs.github.com/)
-  are installed on your machine.
+## Run the App
 
-### 2. Clone the repository
+- Launch GUI (default when no args provided):
+  - `python src/main.py --gui`
 
-```bash
-git clone https://github.com/SajaanJayalath/IS.git
-cd IS
-```
+- CLI options (from `src/main.py`):
+  - `python src/main.py --check-deps`  Check/install status of key packages
+  - `python src/main.py --test-models`  Load available models and run a basic smoke test
+  - `python src/main.py --test-image path/to/image.png --model cnn|svm|rf|ensemble`  Recognize a single image via CLI
 
-If a different folder name is preferred (e.g. `Intelligent_Systems_COS30018`),
-rename the directory after cloning.
+### GUI Tips
 
-### 3. Pull large assets with Git LFS
+- Modes: choose Digits, Letters, or Arithmetic in the GUI
+- Segmentation: digits support auto/contours/connected components/projection; letters use watershed; arithmetic offers Best/Hybrid/Connected Components/Projection
+- Models: the selector reflects what’s available for the active mode
+  - Digits: CNN/SVM/Random Forest (from `models/`)
+  - Letters: k-NN (from `models_new/letters_byclass_knn.pkl`) or CNN (`cnn_model_nist_by_class.h5`)
+  - Arithmetic: CNN/Ensemble if `cnn_model_arithmetic.h5` exists; optional external “MER (External)” if configured
 
-The EMNIST/NIST datasets and related `.mat`/`.ubyte` files are tracked via Git
-LFS. Run the following once inside the repository:
+## Models and Weights
 
-```bash
-git lfs install
-git lfs pull
-```
+- Place weights and label maps in `models/` (root) or `src/models/`. The app searches both.
+- Common files used by the GUI:
+  - Digits: `cnn_model.h5` or `cnn_model_mnist_csv.h5`, `svm_model.pkl`, `rf_model.pkl`, plus `label_mapping_mnist_csv.json` or `label_mapping.json`
+  - Letters: `cnn_model_nist_by_class.h5` with `label_mapping_nist_by_class.json`, or `models_new/letters_byclass_knn.pkl`
+  - Arithmetic: `cnn_model_arithmetic.h5` with `label_mapping_arithmetic.json`
 
-This downloads the full datasets referenced by the project.
+## Datasets
 
-### 4. Install Python dependencies
+- Letters: the k-NN pipeline expects NIST SD19 by_class images under `data/by_class/by_class/` (hex-named folders per class). If `models_new/letters_byclass_knn.pkl` is missing and this dataset is present, the letters pipeline can train a k-NN model.
+- MNIST CSV: used by some loaders in `src/data_loader.py` if you run training scripts or custom experiments.
+- EMNIST/SVHN: supported via torchvision loaders in `src/data_loader.py` for experimentation (optional).
 
-```bash
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
+### Train a quick k-NN letters model
 
-## Running the Application
-
-Launch the Tkinter GUI to draw or upload characters:
+If you have NIST by_class data and want a fast letters baseline for the GUI:
 
 ```bash
-python src/main.py --gui
+python - <<"PY"
+import sys, os
+sys.path.append('src')
+from letters_new.model_knn import train_knn_byclass, save_model
+m, mapping = train_knn_byclass(max_per_class=400, max_total=20000, n_neighbors=3)
+save_model(m, mapping)
+print('Saved models_new/letters_byclass_knn.pkl')
+PY
 ```
 
-Workflow inside the GUI:
+## Optional: External MER Integration (Arithmetic)
 
-1. Choose **Digits** or **Letters** as the recognition target.
-2. Select a model (CNN, SVM, Random Forest) and segmentation strategy.
-3. Draw on the canvas or upload an image file.
-4. Click **Recognize Drawing** or **Process Current Image** to view results.
-5. Toggle the *Show preprocessing* / *Show segmentation* checkboxes to inspect
-   intermediate steps.
+To use the external Math-Expression-Recognizer-and-Solver with the GUI:
 
-## Command-line Utilities
+1) Copy the repo into one of:
+   - `external/Math-Expression-Recognizer-and-Solver`
+   - `src/external/Math-Expression-Recognizer-and-Solver`
+   - `vendor/Math-Expression-Recognizer-and-Solver`
 
-The entry script also provides handy CLI options:
+2) Ensure its `math-recog-model.h5` is present as per that project’s instructions.
 
-```bash
-python src/main.py --help
-python src/main.py --test-image path/to/sample.png --model cnn
-python src/main.py --test-models
-python src/main.py --check-deps
-```
-
-## Training the Models
-
-Pre-trained weights are included, but you can retrain or fine-tune models:
-
-### MNIST / Digit models
-
-```bash
-cd src
-python train_models.py
-```
-
-Outputs are stored under `models/` (e.g. `cnn_model_mnist_csv.h5`) along with a
-`label_mapping_mnist_csv.json` file for inference.
-
-### NIST by_class / Letter models
-
-```bash
-cd src
-python train_letters.py --data-dir data/by_class/by_class
-```
-
-Adjust CLI flags to include/exclude uppercase, lowercase, or digit classes, and
-to tweak Random Forest/CNN hyperparameters. Trained weights and metadata are
-written to `models/` with a corresponding `label_mapping_nist_by_class.json`.
-
-## Machine Learning Models
-
-| Model          | Accuracy* | Highlights                                   |
-|----------------|-----------|----------------------------------------------|
-| CNN            | 99.2%     | Data augmentation, batch norm, dropout       |
-| SVM (RBF)      | 96.3%     | Fast inference, balanced accuracy/simplicity |
-| Random Forest  | 95.1%     | Lightweight baseline, quick to train         |
-
-\*Reported on MNIST validation splits during development. Letter accuracy will
-depend on chosen NIST class subsets.
-
-## Recognition Pipeline
-
-1. **Preprocessing** – grayscale conversion, CLAHE, denoising, adaptive
-   thresholding, morphology, optional deskew.
-2. **Segmentation** – contour detection, connected components, or projection
-   profiles with heuristics for touching characters.
-3. **Normalization** – size normalisation, optional center-of-mass alignment,
-   background polarity adjustment (digits vs letters), and scaling to [0, 1].
-4. **Classification** – selected model predicts each character; ensemble mode
-   (if multiple models loaded) averages probabilities.
-5. **Result aggregation** – characters are ordered left-to-right and displayed
-   with per-character confidences and overall text output.
-
-## Dataset Notes
-
-- `MNIST_CSV/` holds MNIST CSV exports plus EMNIST `.mat`/`.ubyte` files.
-- `data/by_class/` (optional) should contain the extracted NIST Special
-  Database 19 *by_class* dataset for letter training.
-- Large files are stored using Git LFS. Collaborators must install Git LFS and
-  run `git lfs pull` after cloning to obtain the datasets.
-
-## Testing
-
-Basic test scaffolding lives under `tests/`. Example usage:
-
-```bash
-python -m pytest -q          # if pytest is available
-python tests/test_system.py  # custom integration script
-```
+The GUI will show a model choice “MER (External)” under Arithmetic when detected. The adapter is implemented in `src/integrations/mer_adapter.py`.
 
 ## Troubleshooting
 
-- **TensorFlow unavailable** – The CNN model needs TensorFlow 2.15 (or similar)
-  for Python 3.10/3.11. Install using `pip install tensorflow==2.15.*` or stick
-  with SVM/Random Forest models.
-- **Large file checkout errors** – Ensure `git lfs install` and `git lfs pull`
-  run successfully; without them you will only have pointer files.
-- **Blank predictions** – Verify label mapping files in `models/` correspond to
-  the active recognition mode and that the segmentation method detects all
-  characters.
+- TensorFlow unavailable: CNN features require a compatible TensorFlow (e.g., TF 2.15 on Python 3.10/3.11). Without TF, use SVM/Random Forest/k-NN backends.
+- Empty or low-confidence results: try a different segmentation method (GUI selector) or ensure the correct label mapping JSON exists in `models/`.
+- Letters mode shows only k-NN: provide `cnn_model_nist_by_class.h5` and `label_mapping_nist_by_class.json` to enable CNN.
+- Arithmetic mode missing: provide `cnn_model_arithmetic.h5` and `label_mapping_arithmetic.json`, or configure the external MER repo.
 
 ## Maintainer
 
-- **Sajaan Jayalath** – sajjayalath@example.com *(replace with preferred contact)*
+- Sajaan Jayalath
 
-Contributions and bug reports are welcome via GitHub issues or pull requests on
-[`SajaanJayalath/IS`](https://github.com/SajaanJayalath/IS).
+Feel free to open issues or PRs for bugs and enhancements.
 

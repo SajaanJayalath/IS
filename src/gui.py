@@ -23,6 +23,8 @@ from models import CNNModel, SVMModel, RandomForestModel
 from image_preprocessing import ImagePreprocessor, preprocess_for_mnist_model, prepare_for_character_model
 from image_segmentation import ImageSegmenter, MultiDigitProcessor
 from letters_new import LettersPipeline
+from arithmetic import ArithmeticPipeline
+from integrations.mer_adapter import MERSolverAdapter
 
 class DrawingCanvas:
     """Canvas for drawing handwritten characters"""
@@ -31,6 +33,9 @@ class DrawingCanvas:
         self.parent = parent
         self.width = width
         self.height = height
+        self.mode = 'draw'  # 'draw' or 'erase'
+        self.brush_width = 8
+        self.eraser_width = 12
         
         # Create canvas
         self.canvas = tk.Canvas(parent, width=width, height=height, bg='white', cursor='pencil')
@@ -57,11 +62,25 @@ class DrawingCanvas:
         """Draw line on canvas"""
         if self.last_x and self.last_y:
             # Draw on tkinter canvas
-            self.canvas.create_line(self.last_x, self.last_y, event.x, event.y, 
-                                  width=8, fill='black', capstyle=tk.ROUND, smooth=tk.TRUE)
+            color = 'white' if self.mode == 'erase' else 'black'
+            width = self.eraser_width if self.mode == 'erase' else self.brush_width
+            self.canvas.create_line(
+                self.last_x,
+                self.last_y,
+                event.x,
+                event.y,
+                width=width,
+                fill=color,
+                capstyle=tk.ROUND,
+                smooth=tk.TRUE,
+            )
             
             # Draw on PIL image
-            self.draw.line([self.last_x, self.last_y, event.x, event.y], fill='black', width=8)
+            self.draw.line(
+                [self.last_x, self.last_y, event.x, event.y],
+                fill='white' if self.mode == 'erase' else 'black',
+                width=width,
+            )
             
         self.last_x = event.x
         self.last_y = event.y
@@ -76,6 +95,22 @@ class DrawingCanvas:
         self.canvas.delete('all')
         self.image = Image.new('RGB', (self.width, self.height), 'white')
         self.draw = ImageDraw.Draw(self.image)
+        self.set_mode('draw')
+
+    def set_mode(self, mode: str):
+        """Set drawing mode: 'draw' or 'erase'"""
+        if mode not in ('draw', 'erase'):
+            return
+        self.mode = mode
+        try:
+            self.canvas.config(cursor='pencil' if mode == 'draw' else 'circle')
+        except Exception:
+            # Fallback if cursor not available on platform
+            self.canvas.config(cursor='arrow')
+
+    def toggle_eraser(self):
+        """Toggle eraser mode on/off"""
+        self.set_mode('erase' if self.mode != 'erase' else 'draw')
         
     def get_image_array(self):
         """Get the drawn image as numpy array"""
@@ -98,6 +133,8 @@ class HNRSApplication:
         self.segmenter = ImageSegmenter()
         self.multi_digit_processor = MultiDigitProcessor()
         self.letter_pipeline = LettersPipeline()
+        self.arithmetic_pipeline = ArithmeticPipeline()
+        self.mer_adapter = MERSolverAdapter()
         self.models = {}
         self.last_auto_seg_method: str | None = None
 
@@ -163,10 +200,34 @@ class HNRSApplication:
                 self.active_mode = mode_key
                 self.active_dataset = dataset
                 self.active_label_mapping = label_mapping
+                if dataset == "arithmetic":
+                    self._refresh_model_selector()
+                    self._update_segmentation_options()
+                    return
                 allowed_chars = self._allowed_characters_for_mode(mode_key, label_mapping)
                 self._configure_multi_digit_models(label_mapping, allowed_chars, config.get("allowed_type"))
                 self._configure_letter_pipeline(mode_key, allowed_chars)
                 self._refresh_model_selector()
+                return
+
+            if dataset == "arithmetic":
+                self.arithmetic_pipeline.load_models(force_reload)
+                available = self.arithmetic_pipeline.get_available_models()
+                # Add external MER solver as an additional option in arithmetic mode
+                if "MER (External)" not in available:
+                    available.append("MER (External)")
+                self.models = {name: name for name in available}
+                self.active_mode = mode_key
+                self.active_dataset = dataset
+                self.active_label_mapping = dict(self.arithmetic_pipeline.label_mapping)
+                self.model_cache[mode_key] = {
+                    "models": dict(self.models),
+                    "label_mapping": dict(self.active_label_mapping),
+                }
+                self._refresh_model_selector()
+                self._update_segmentation_options()
+                if hasattr(self, "status_var"):
+                    self.update_status("Loaded arithmetic models")
                 return
 
             def candidate_names(basename: str) -> list[str]:
@@ -330,11 +391,38 @@ class HNRSApplication:
             return
         if self.active_mode == 'letters':
             values = ["Auto selection", "watershed"]
+        elif self.active_mode == "arithmetic":
+            values = ["Best", "Hybrid", "Connected Components", "Projection"]
         else:
             values = ["Auto selection", "contours", "connected_components", "projection"]
         self.seg_combo["values"] = values
         if self.segmentation_var.get() not in values:
             self.segmentation_var.set(values[0] if values else "")
+
+    def _update_letters_only_visibility(self) -> None:
+        """Show letters-only controls only when in letters mode."""
+        if not hasattr(self, 'case_label') or not hasattr(self, 'case_combo'):
+            return
+        if getattr(self, 'active_mode', None) == 'letters':
+            # Ensure packed
+            try:
+                self.case_label.pack_info()
+            except Exception:
+                self.case_label.pack(pady=(10, 2))
+            try:
+                self.case_combo.pack_info()
+            except Exception:
+                self.case_combo.pack(pady=(0, 10))
+        else:
+            # Hide when not relevant
+            try:
+                self.case_label.pack_forget()
+            except Exception:
+                pass
+            try:
+                self.case_combo.pack_forget()
+            except Exception:
+                pass
 
     def _run_letter_recognition(
         self,
@@ -470,6 +558,7 @@ class HNRSApplication:
         previous_mode = self.active_mode
         self.load_models(selected_mode)
         self._update_segmentation_options()
+        self._update_letters_only_visibility()
         if self.active_mode != selected_mode:
             self.recognition_var.set(previous_mode)
 
@@ -507,6 +596,13 @@ class HNRSApplication:
         
         ttk.Button(canvas_controls, text="Clear Canvas", 
                   command=self.clear_canvas).pack(side=tk.LEFT, padx=5)
+        # Eraser toggle button
+        self.eraser_button = ttk.Button(
+            canvas_controls,
+            text="Eraser: Off",
+            command=self.toggle_eraser_mode,
+        )
+        self.eraser_button.pack(side=tk.LEFT, padx=5)
         ttk.Button(canvas_controls, text="Recognize Drawing", 
                   command=self.recognize_drawing).pack(side=tk.LEFT, padx=5)
         
@@ -576,10 +672,11 @@ class HNRSApplication:
 
         # Letters-only: assume case selector
         self.case_var = tk.StringVar(value="Auto")
-        ttk.Label(control_frame, text="Assume Case (letters):").pack(pady=(10, 2))
+        self.case_label = ttk.Label(control_frame, text="Assume Case (letters):")
         self.case_combo = ttk.Combobox(control_frame, textvariable=self.case_var, state="readonly")
         self.case_combo["values"] = ["Auto", "Uppercase", "Lowercase"]
-        self.case_combo.pack(pady=(0, 10))
+        # Initial visibility based on active mode
+        self._update_letters_only_visibility()
         
         # Action buttons
         ttk.Separator(control_frame, orient='horizontal').pack(fill=tk.X, pady=10)
@@ -624,7 +721,24 @@ class HNRSApplication:
         """Clear the drawing canvas"""
         self.drawing_canvas.clear_canvas()
         self.current_image = None
+        # Reset eraser toggle UI
+        try:
+            if hasattr(self, 'eraser_button'):
+                self.eraser_button.config(text="Eraser: Off")
+        except Exception:
+            pass
         self.update_status("Canvas cleared")
+
+    def toggle_eraser_mode(self):
+        """Toggle eraser mode for the drawing canvas and update UI"""
+        try:
+            self.drawing_canvas.toggle_eraser()
+            is_eraser = getattr(self.drawing_canvas, 'mode', 'draw') == 'erase'
+            if hasattr(self, 'eraser_button'):
+                self.eraser_button.config(text=f"Eraser: {'On' if is_eraser else 'Off'}")
+            self.update_status("Eraser enabled" if is_eraser else "Eraser disabled")
+        except Exception as e:
+            print(f"Error toggling eraser: {e}")
         
     def upload_image(self):
         """Upload image file"""
@@ -684,6 +798,9 @@ class HNRSApplication:
 
             selection_raw = self.segmentation_var.get()
             segmentation_method = selection_raw.lower().replace(' ', '_')
+            if self.active_mode == "arithmetic":
+                if segmentation_method in {'auto_selection', 'auto'}:
+                    segmentation_method = 'best'
 
             if self.active_mode == "letters":
                 method = segmentation_method
@@ -704,6 +821,23 @@ class HNRSApplication:
                 text, preds, imgs = self.letter_pipeline.recognize(self.current_image, method, model=model_choice)
                 number_string, predictions, digit_images = text, preds, imgs
                 used_method_display = selection_raw
+            elif self.active_mode == "arithmetic":
+                if model_display == "MER (External)":
+                    number_string, predictions, digit_images = self.mer_adapter.recognize(self.current_image)
+                    used_method_display = "MER"
+                    # Try MER's own solver first; fallback to local safe evaluator
+                    solved = self.mer_adapter.solve(number_string)
+                    if solved is None:
+                        expression_info = self._evaluate_arithmetic_expression(number_string)
+                    else:
+                        expression_info = (number_string, str(solved))
+                else:
+                    number_string, predictions, digit_images, used_method_display = self.arithmetic_pipeline.recognise(
+                        self.current_image,
+                        segmentation_method,
+                        model_display,
+                    )
+                    expression_info = self._evaluate_arithmetic_expression(number_string)
             else:
                 model_name = model_display.lower().replace(' ', '_')
                 if model_name == 'random_forest':
@@ -733,8 +867,6 @@ class HNRSApplication:
                     )
                     used_method = segmentation_method
                     self.last_auto_seg_method = segmentation_method
-                if self.active_mode == "arithmetic":
-                    expression_info = self._evaluate_arithmetic_expression(number_string)
             if self.active_mode == "arithmetic" and expression_info is None:
                 expression_info = self._evaluate_arithmetic_expression(number_string)
         
@@ -850,6 +982,28 @@ class HNRSApplication:
                     except Exception as e:
                         self.results_text.insert(tk.END, f"{model_display_name} Model: Error - {e}\n\n")
                 return
+            if self.active_mode == "arithmetic":
+                method = segmentation_method
+                if method in {'auto_selection', 'hybrid'}:
+                    method = 'hybrid'
+                for model_display_name in self.models.keys():
+                    try:
+                        number_string, predictions, _, seg_used = self.arithmetic_pipeline.recognise(
+                            self.current_image,
+                            method,
+                            model_display_name,
+                        )
+                        avg_confidence = np.mean([conf for _, conf in predictions]) if predictions else 0
+                        expr_norm, expr_val = self._evaluate_arithmetic_expression(number_string)
+                        self.results_text.insert(tk.END, f"{model_display_name}:\n")
+                        self.results_text.insert(tk.END, f"  Result: {number_string}\n")
+                        self.results_text.insert(tk.END, f"  Eval: {(expr_norm or number_string)} = {expr_val}\n")
+                        self.results_text.insert(tk.END, f"  Avg Confidence: {avg_confidence:.3f}\n")
+                        self.results_text.insert(tk.END, f"  Segmentation: {seg_used}\n")
+                        self.results_text.insert(tk.END, f"  Individual: {[pred[0] for pred in predictions]}\n\n")
+                    except Exception as e:
+                        self.results_text.insert(tk.END, f"{model_display_name}: Error - {e}\n\n")
+                return
 
             # Digit comparison (original pipeline)
             for model_display_name, model_key in [('CNN', 'cnn'), ('SVM', 'svm'), ('Random Forest', 'rf')]:
@@ -918,6 +1072,30 @@ class HNRSApplication:
                         avg_conf = np.mean([c for _, c in predictions]) if predictions else 0
                         chars = [p[0] for p in predictions]
                         self.results_text.insert(tk.END, f"{m}: {number_string}  | characters: {chars}  | avg: {avg_conf:.3f}\n")
+                    except Exception as e:
+                        self.results_text.insert(tk.END, f"{m}: Error - {e}\n")
+
+                self.update_status("Segmentation methods compared")
+                return
+            if self.active_mode == "arithmetic":
+                methods = ["hybrid"]
+                self.results_text.delete(1.0, tk.END)
+                self.results_text.insert(tk.END, "SEGMENTATION METHOD COMPARISON\n")
+                self.results_text.insert(tk.END, "="*50 + "\n\n")
+
+                for m in methods:
+                    try:
+                        number_string, predictions, _, seg_used = self.arithmetic_pipeline.recognise(
+                            self.current_image,
+                            m,
+                            self.model_var.get(),
+                        )
+                        avg_conf = np.mean([c for _, c in predictions]) if predictions else 0
+                        expr_norm, expr_val = self._evaluate_arithmetic_expression(number_string)
+                        self.results_text.insert(
+                            tk.END,
+                            f"{seg_used}: {number_string} | eval: {(expr_norm or number_string)} = {expr_val} | avg: {avg_conf:.3f}\n"
+                        )
                     except Exception as e:
                         self.results_text.insert(tk.END, f"{m}: Error - {e}\n")
 
@@ -1052,24 +1230,58 @@ class HNRSApplication:
         """Show segmentation visualization in new window"""
         if self.current_image is None:
             return
-            
+        
         try:
             # Create new window
             seg_window = tk.Toplevel(self.root)
             seg_window.title("Segmentation Visualization")
             seg_window.geometry("1000x600")
             
-            # Get a Matplotlib figure and embed it in the Tk window
             sel = self.segmentation_var.get()
             method = sel.lower().replace(' ', '_')
             if method == 'auto_selection':
                 method = self.last_auto_seg_method or 'contours'
-            fig = self.segmenter.visualize_segmentation(
-                self.current_image, method, return_fig=True
-            )
-            if fig is None:
-                ttk.Label(seg_window, text="No characters found to visualize").pack(padx=20, pady=20)
-                return
+
+            if self.active_mode == "arithmetic":
+                overlay = self.arithmetic_pipeline.segmenter.visualise(self.current_image)
+                patches = self.arithmetic_pipeline.segmenter.segment(self.current_image)
+                if overlay is None or not patches:
+                    ttk.Label(seg_window, text="No characters found to visualize").pack(padx=20, pady=20)
+                    return
+
+                cols = max(3, len(patches))
+                fig, axes = plt.subplots(2, cols, figsize=(14, 6))
+                for ax in axes.flat:
+                    ax.axis('off')
+
+                # Display original input and overlay
+                if len(self.current_image.shape) == 2:
+                    axes[0, 0].imshow(self.current_image, cmap='gray')
+                else:
+                    axes[0, 0].imshow(cv2.cvtColor(self.current_image, cv2.COLOR_BGR2RGB))
+                axes[0, 0].set_title("Original")
+                axes[0, 0].axis('off')
+
+                overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+                axes[0, 1].imshow(overlay_rgb)
+                axes[0, 1].set_title("Segmentation Overlay")
+                axes[0, 1].axis('off')
+
+                for idx, patch in enumerate(patches):
+                    if idx >= cols:
+                        break
+                    axes[1, idx].imshow(patch, cmap='gray')
+                    axes[1, idx].set_title(f"Patch {idx+1}")
+                    axes[1, idx].axis('off')
+
+                plt.tight_layout()
+            else:
+                fig = self.segmenter.visualize_segmentation(
+                    self.current_image, method, return_fig=True
+                )
+                if fig is None:
+                    ttk.Label(seg_window, text="No characters found to visualize").pack(padx=20, pady=20)
+                    return
 
             canvas = FigureCanvasTkAgg(fig, master=seg_window)
             canvas.draw()
