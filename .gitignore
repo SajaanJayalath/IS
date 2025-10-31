@@ -198,6 +198,9 @@ secrets.json
 .env.local
 .env.production
 
+# Windows reserved device files (avoid accidental creation)
+CON
+
 # Backup files
 *.bak
 *.backup
