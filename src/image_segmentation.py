@@ -16,6 +16,7 @@ class ImageSegmenter:
     
     def __init__(self):
         self.preprocessor = ImagePreprocessor()
+        self.processing_profile: str = 'digits'
         
     def find_contours(self, image: np.ndarray) -> List[np.ndarray]:
         """Find contours in the image"""

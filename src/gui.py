@@ -8,12 +8,13 @@ from tkinter import ttk, filedialog, messagebox
 import cv2
 import numpy as np
 import json
+import ast
 from PIL import Image, ImageTk, ImageDraw
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import os
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 # Add src directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -110,6 +111,11 @@ class HNRSApplication:
                 "label": "Letters (A-Z, a-z)",
                 "dataset": "letters_new",
                 "allowed_type": "letters",
+            },
+            "arithmetic": {
+                "label": "Arithmetic Expressions",
+                "dataset": "arithmetic",
+                "allowed_type": "arithmetic",
             },
         }
         self.model_cache: Dict[str, Dict[str, Any]] = {}
@@ -272,6 +278,9 @@ class HNRSApplication:
             uppercase = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
             lowercase = [chr(c) for c in range(ord("a"), ord("z") + 1)]
             base_chars = uppercase + lowercase
+        elif allowed_type == "arithmetic":
+            base_chars = [str(i) for i in range(10)]
+            base_chars += ["+", "-", "*", "x", "X", "×", "/", "÷", "=", "(", ")"]
         else:
             return None
         mapping_values = set(label_mapping.values())
@@ -307,10 +316,25 @@ class HNRSApplication:
     def _configure_letter_pipeline(self, mode_key: str, allowed_chars: set[str] | None) -> None:
         if mode_key != "letters":
             return
-        if not self.models or not self.active_label_mapping:
-            return
-        # new pipeline loads and manages its own model; nothing to configure
+        # Populate model selector from letters pipeline availability
+        try:
+            available = self.letter_pipeline.get_available_models()
+        except Exception:
+            available = ["kNN"]
+        self.models = {name: True for name in available}
+        self._refresh_model_selector()
         return
+
+    def _update_segmentation_options(self) -> None:
+        if not hasattr(self, 'seg_combo'):
+            return
+        if self.active_mode == 'letters':
+            values = ["Auto selection", "watershed"]
+        else:
+            values = ["Auto selection", "contours", "connected_components", "projection"]
+        self.seg_combo["values"] = values
+        if self.segmentation_var.get() not in values:
+            self.segmentation_var.set(values[0] if values else "")
 
     def _run_letter_recognition(
         self,
@@ -355,6 +379,79 @@ class HNRSApplication:
             digit_images = [base]
 
         return text, predictions, digit_images, method_display
+
+    def _normalize_expression_text(self, raw_text: str) -> str:
+        """Normalize recognized arithmetic text for safe evaluation."""
+        if not raw_text:
+            return ""
+        replacements = {
+            "×": "*",
+            "x": "*",
+            "X": "*",
+            "÷": "/",
+            "–": "-",
+            "—": "-",
+            "−": "-",
+        }
+        normalized = raw_text
+        for src, dst in replacements.items():
+            normalized = normalized.replace(src, dst)
+        normalized = "".join(ch for ch in normalized if not ch.isspace())
+        # Remove trailing equals sign if present (common in handwriting)
+        if normalized.endswith("="):
+            normalized = normalized[:-1]
+        # Leading equals occasionally appears; strip it as well
+        while normalized.startswith("="):
+            normalized = normalized[1:]
+        return normalized
+
+    def _safe_eval_node(self, node: ast.AST) -> float:
+        """Evaluate an AST node with a restricted set of operations."""
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return float(node.value)
+            raise ValueError("Unsupported constant type")
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            operand = self._safe_eval_node(node.operand)
+            return operand if isinstance(node.op, ast.UAdd) else -operand
+        if isinstance(node, ast.BinOp):
+            left = self._safe_eval_node(node.left)
+            right = self._safe_eval_node(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.FloorDiv):
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+        raise ValueError("Unsupported expression element")
+
+    def _evaluate_arithmetic_expression(self, raw_text: str) -> Tuple[str, str]:
+        """Evaluate the recognized arithmetic expression safely."""
+        normalized = self._normalize_expression_text(raw_text)
+        if not normalized:
+            return "", "No expression recognized"
+        try:
+            parsed = ast.parse(normalized, mode="eval")
+        except SyntaxError as exc:
+            return normalized, f"Parse error: {exc.msg or exc}"
+        try:
+            result = self._safe_eval_node(parsed.body)
+        except ZeroDivisionError:
+            return normalized, "Division by zero"
+        except Exception as exc:
+            return normalized, f"Evaluation error: {exc}"
+        # Prefer integer representation when appropriate
+        if abs(result - round(result)) < 1e-9:
+            display_value = str(int(round(result)))
+        else:
+            display_value = f"{result:.6g}"
+        return normalized, display_value
     def _refresh_model_selector(self) -> None:
         if not hasattr(self, "model_var") or not hasattr(self, "model_combo"):
             return
@@ -372,6 +469,7 @@ class HNRSApplication:
             return
         previous_mode = self.active_mode
         self.load_models(selected_mode)
+        self._update_segmentation_options()
         if self.active_mode != selected_mode:
             self.recognition_var.set(previous_mode)
 
@@ -430,10 +528,7 @@ class HNRSApplication:
         target_label.pack(pady=(0, 5))
 
         self.recognition_var = tk.StringVar(value=self.active_mode)
-        for mode_key in ("digits", "letters"):
-            if mode_key not in self.recognition_modes:
-                continue
-            mode_info = self.recognition_modes[mode_key]
+        for mode_key, mode_info in self.recognition_modes.items():
             ttk.Radiobutton(
                 control_frame,
                 text=mode_info["label"],
@@ -464,20 +559,27 @@ class HNRSApplication:
         seg_label.pack(pady=(0, 5))
         
         self.segmentation_var = tk.StringVar(value="Auto selection")
-        seg_combo = ttk.Combobox(control_frame, textvariable=self.segmentation_var,
-                                values=["Auto selection", "contours", "connected_components", "projection"], state="readonly")
-        seg_combo.pack(pady=(0, 10))
+        self.seg_combo = ttk.Combobox(control_frame, textvariable=self.segmentation_var, state="readonly")
+        self.seg_combo.pack(pady=(0, 10))
+        self._update_segmentation_options()
         
         # Processing options
         ttk.Separator(control_frame, orient='horizontal').pack(fill=tk.X, pady=10)
-        
+
         self.show_preprocessing = tk.BooleanVar(value=True)
         ttk.Checkbutton(control_frame, text="Show preprocessing steps", 
                        variable=self.show_preprocessing).pack(pady=2)
-        
+
         self.show_segmentation = tk.BooleanVar(value=True)
         ttk.Checkbutton(control_frame, text="Show segmentation process", 
                        variable=self.show_segmentation).pack(pady=2)
+
+        # Letters-only: assume case selector
+        self.case_var = tk.StringVar(value="Auto")
+        ttk.Label(control_frame, text="Assume Case (letters):").pack(pady=(10, 2))
+        self.case_combo = ttk.Combobox(control_frame, textvariable=self.case_var, state="readonly")
+        self.case_combo["values"] = ["Auto", "Uppercase", "Lowercase"]
+        self.case_combo.pack(pady=(0, 10))
         
         # Action buttons
         ttk.Separator(control_frame, orient='horizontal').pack(fill=tk.X, pady=10)
@@ -572,6 +674,7 @@ class HNRSApplication:
             
         try:
             self.update_status("Processing image...")
+            expression_info: Tuple[str, str] | None = None
             
             model_display = self.model_var.get()
             if not model_display:
@@ -583,8 +686,22 @@ class HNRSApplication:
             segmentation_method = selection_raw.lower().replace(' ', '_')
 
             if self.active_mode == "letters":
-                text, preds, imgs = self.letter_pipeline.recognize(self.current_image,
-                                                                   'cc' if segmentation_method == 'auto_selection' else segmentation_method)
+                method = segmentation_method
+                if method == 'auto_selection':
+                    method = 'auto_selection'
+                else:
+                    # Only watershed supported for letters segmentation
+                    method = 'watershed'
+                # Apply case restriction to letters pipeline
+                case_mode = self.case_var.get().lower()
+                if case_mode.startswith('upper'):
+                    self.letter_pipeline.set_allowed_characters('uppercase')
+                elif case_mode.startswith('lower'):
+                    self.letter_pipeline.set_allowed_characters('lowercase')
+                else:
+                    self.letter_pipeline.set_allowed_characters(None)
+                model_choice = self.model_var.get() or 'auto'
+                text, preds, imgs = self.letter_pipeline.recognize(self.current_image, method, model=model_choice)
                 number_string, predictions, digit_images = text, preds, imgs
                 used_method_display = selection_raw
             else:
@@ -616,9 +733,13 @@ class HNRSApplication:
                     )
                     used_method = segmentation_method
                     self.last_auto_seg_method = segmentation_method
-            
+                if self.active_mode == "arithmetic":
+                    expression_info = self._evaluate_arithmetic_expression(number_string)
+            if self.active_mode == "arithmetic" and expression_info is None:
+                expression_info = self._evaluate_arithmetic_expression(number_string)
+        
             # Display results
-            self.display_results(number_string, predictions, digit_images, used_method_display)
+            self.display_results(number_string, predictions, digit_images, used_method_display, expression_info)
             
             # Show visualizations if requested
             if self.show_preprocessing.get():
@@ -633,13 +754,28 @@ class HNRSApplication:
             messagebox.showerror("Error", f"Error processing image: {e}")
             self.update_status("Error during processing")
             
-    def display_results(self, number_string, predictions, digit_images, segmentation_used: str | None = None):
+    def display_results(
+        self,
+        number_string,
+        predictions,
+        digit_images,
+        segmentation_used: str | None = None,
+        expression_info: Tuple[str, str] | None = None,
+    ):
         """Display recognition results in the text widget"""
         self.results_text.delete(1.0, tk.END)
         
         # Main result
         self.results_text.insert(tk.END, f"RECOGNIZED TEXT: {number_string}\n")
         self.results_text.insert(tk.END, "="*40 + "\n\n")
+
+        if expression_info:
+            normalized_expr, eval_result = expression_info
+            self.results_text.insert(
+                tk.END,
+                f"Evaluated Expression: {normalized_expr or number_string}\n"
+            )
+            self.results_text.insert(tk.END, f"Result: {eval_result}\n\n")
         
         # Individual digit results
         self.results_text.insert(tk.END, "Individual Character Predictions:\n")
@@ -652,6 +788,13 @@ class HNRSApplication:
         
         # Model information
         model_name = self.model_var.get()
+        if self.active_mode == "letters":
+            try:
+                used_backend = self.letter_pipeline.last_used_model()
+                if used_backend:
+                    model_name = used_backend
+            except Exception:
+                pass
         self.results_text.insert(tk.END, f"Model Used: {model_name}\n")
         mode_label = self.recognition_modes.get(self.active_mode, {}).get("label", self.active_mode)
         self.results_text.insert(tk.END, f"Recognition Target: {mode_label}\n")
@@ -688,9 +831,16 @@ class HNRSApplication:
                         self.results_text.insert(tk.END, f"{model_display_name} Model: Not loaded\n\n")
                         continue
                     try:
-                        number_string, predictions, _, seg_used = self.letter_pipeline.process_image(
-                            self.current_image, model_display_name, segmentation_method
+                        method = segmentation_method
+                        if method == 'auto_selection':
+                            method = 'auto_selection'
+                        elif method == 'connected_components':
+                            method = 'cc_split'
+                        text, predictions, _ = self.letter_pipeline.recognize(
+                            self.current_image, method, model=model_display_name
                         )
+                        number_string = text
+                        seg_used = selection_raw
                         avg_confidence = np.mean([conf for _, conf in predictions]) if predictions else 0
                         self.results_text.insert(tk.END, f"{model_display_name} Model:\n")
                         self.results_text.insert(tk.END, f"  Result: {number_string}\n")
@@ -717,9 +867,16 @@ class HNRSApplication:
                             seg_used = selection_raw
                         
                         avg_confidence = np.mean([conf for _, conf in predictions]) if predictions else 0
+                        eval_line = ""
+                        if self.active_mode == "arithmetic":
+                            expr_norm, expr_val = self._evaluate_arithmetic_expression(number_string)
+                            shown_expr = expr_norm or number_string
+                            eval_line = f"  Eval: {shown_expr} = {expr_val}\n"
                         
                         self.results_text.insert(tk.END, f"{model_display_name} Model:\n")
                         self.results_text.insert(tk.END, f"  Result: {number_string}\n")
+                        if eval_line:
+                            self.results_text.insert(tk.END, eval_line)
                         self.results_text.insert(tk.END, f"  Avg Confidence: {avg_confidence:.3f}\n")
                         self.results_text.insert(tk.END, f"  Segmentation: {seg_used}\n")
                         self.results_text.insert(tk.END, f"  Individual: {[pred[0] for pred in predictions]}\n\n")
@@ -747,16 +904,17 @@ class HNRSApplication:
                 model_name = 'rf'
 
             if self.active_mode == "letters":
-                methods = ["contours", "connected_components", "projection"]
+                methods = ["watershed"]
                 self.results_text.delete(1.0, tk.END)
                 self.results_text.insert(tk.END, "SEGMENTATION METHOD COMPARISON\n")
                 self.results_text.insert(tk.END, "="*50 + "\n\n")
 
                 for m in methods:
                     try:
-                        number_string, predictions, _, _ = self.letter_pipeline.process_image(
-                            self.current_image, self.model_var.get(), m
+                        text, predictions, _ = self.letter_pipeline.recognize(
+                            self.current_image, m, model=self.model_var.get()
                         )
+                        number_string = text
                         avg_conf = np.mean([c for _, c in predictions]) if predictions else 0
                         chars = [p[0] for p in predictions]
                         self.results_text.insert(tk.END, f"{m}: {number_string}  | characters: {chars}  | avg: {avg_conf:.3f}\n")
@@ -782,7 +940,15 @@ class HNRSApplication:
                         self.current_image, model_name, m
                     )
                     avg_conf = np.mean([c for _, c in predictions]) if predictions else 0
-                    self.results_text.insert(tk.END, f"{m}: {number_string}  | characters: {[p[0] for p in predictions]}  | avg: {avg_conf:.3f}\n")
+                    eval_note = ""
+                    if self.active_mode == "arithmetic":
+                        expr_norm, expr_val = self._evaluate_arithmetic_expression(number_string)
+                        shown_expr = expr_norm or number_string
+                        eval_note = f"  => {shown_expr} = {expr_val}"
+                    self.results_text.insert(
+                        tk.END,
+                        f"{m}: {number_string}  | characters: {[p[0] for p in predictions]}  | avg: {avg_conf:.3f}{eval_note}\n"
+                    )
                 except Exception as e:
                     self.results_text.insert(tk.END, f"{m}: Error - {e}\n")
 
